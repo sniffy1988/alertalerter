@@ -1,13 +1,9 @@
 import { PrismaClient } from '@prisma/client';
-import { PrismaBetterSqlite3 } from '@prisma/adapter-better-sqlite3';
-import BetterSqlite3 from 'better-sqlite3';
 
-const rawUrl = process.env.DATABASE_URL || 'file:./dev.db';
-const dbPath = rawUrl.startsWith('file:') ? rawUrl.replace('file:', '') : rawUrl;
+// In Prisma 6, with SQLite, we don't need manual adapters 
+// for standard file-based operations. 
+// It will automatically use its internal engine.
 
-// Use the constructor that the library actually expects in its factory
-const adapter = new PrismaBetterSqlite3({ url: dbPath });
-
-const prisma = new PrismaClient({ adapter });
+const prisma = new PrismaClient();
 
 export default prisma;
