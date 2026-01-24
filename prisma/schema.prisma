@@ -1,0 +1,60 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Channel {
+  id             Int       @id @default(autoincrement())
+  name           String?
+  link           String    @unique
+  scrapTimeout   Int       @default(60000)
+  addedAt        DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  lastScrapedAt  DateTime?
+
+  messages       Message[]
+  subscribers    User[]    @relation("UserSubscriptions")
+}
+
+model Message {
+  id              Int      @id @default(autoincrement())
+  telegramId      BigInt
+  message         String   // Text content
+  date            DateTime // Original post time from Telegram
+  sent            Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  channelId       Int
+  channel         Channel  @relation(fields: [channelId], references: [id])
+
+  @@unique([telegramId, channelId])
+}
+
+model User {
+  id           Int       @id @default(autoincrement())
+  telegramId   BigInt    @unique
+  username     String?
+  firstName    String?
+  lastName     String?
+  registeredAt DateTime  @default(now())
+  silentMode    Boolean   @default(false)
+  isAdmin      Boolean   @default(false)
+  locale       String    @default("ua")
+  isBanned     Boolean   @default(false)
+  
+  subscribedTo Channel[] @relation("UserSubscriptions")
+}
+
+model FilterPhrase {
+  id      Int     @id @default(autoincrement())
+  phrase  String  @unique
+  exclude Boolean @default(false)
+}

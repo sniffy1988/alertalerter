@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    restart: always
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    environment:
+      - DATABASE_URL=file:/database/alerts.db
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - NODE_ENV=production
+      - LOG_LEVEL=info
+    volumes:
+      - ./db_data:/database
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  studio:
+    build: .
+    restart: always
+    command: npx prisma studio --browser none --port 5555 --hostname 0.0.0.0
+    ports:
+      - "5555:5555"
+    environment:
+      - DATABASE_URL=file:/database/alerts.db
+    volumes:
+      - ./db_data:/database
+    depends_on:
+      - app

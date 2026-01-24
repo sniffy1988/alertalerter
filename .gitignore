@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+/src/generated/prisma
+*.db
+*.db-journal
+db_data/
+npm-debug.log
+.DS_Store
+*.log
