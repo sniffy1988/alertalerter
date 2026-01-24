@@ -13,7 +13,7 @@
     "dev": "nodemon src/index.ts"
   },
   "prisma": {
-    "seed": "ts-node prisma/seed.ts"
+    "seed": "node dist/seed.js"
   },
   "devDependencies": {
     "@types/axios": "^0.9.36",
