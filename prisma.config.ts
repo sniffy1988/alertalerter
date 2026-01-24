@@ -7,6 +7,6 @@ export default defineConfig({
         path: "prisma/migrations",
     },
     datasource: {
-        url: "file:./dev.db", // Local file for migration tool
+        url: process.env.DATABASE_URL as string,
     },
 });
