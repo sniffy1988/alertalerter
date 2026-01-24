@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   app:
-    build: .
+    image: ghcr.io/sniffy1988/alertalerter:latest
     restart: always
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:8080/" ]
@@ -24,7 +24,7 @@ services:
         max-file: "3"
 
   studio:
-    build: .
+    image: ghcr.io/sniffy1988/alertalerter:latest
     restart: always
     command: npx prisma studio --browser none --port 5555 --hostname 0.0.0.0
     ports:
