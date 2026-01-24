@@ -1,4 +1,5 @@
-import prisma from '../src/db';
+import { PrismaClient } from '@prisma/client';
+const prisma = new PrismaClient();
 
 const dictionary = [
     // --- POSITIVE HITS (Should send) ---
