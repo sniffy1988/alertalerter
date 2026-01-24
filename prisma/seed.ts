@@ -1,4 +1,4 @@
-import prisma from './src/db';
+import prisma from '../src/db';
 
 const dictionary = [
     // --- POSITIVE HITS (Should send) ---
