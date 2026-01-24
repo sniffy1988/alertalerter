@@ -16,18 +16,17 @@
     "@types/axios": "^0.9.36",
     "@types/better-sqlite3": "^7.6.13",
     "@types/cheerio": "^0.22.35",
-    "@types/node": "^25.0.10",
+    "@types/node": "^24.0.0",
     "@types/pino": "^7.0.4",
     "nodemon": "^3.1.11",
-    "prisma": "^7.3.0",
+    "prisma": "^6.2.1",
     "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+    "typescript": "^5.0.0"
   },
   "dependencies": {
-    "@prisma/adapter-better-sqlite3": "^7.3.0",
-    "@prisma/client": "^7.3.0",
+    "@prisma/client": "^6.2.1",
     "axios": "^1.13.2",
-    "better-sqlite3": "^12.6.2",
+    "better-sqlite3": "^11.8.0",
     "cheerio": "^1.2.0",
     "dotenv": "^17.2.3",
     "grammy": "^1.39.3",
