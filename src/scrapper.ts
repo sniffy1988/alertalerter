@@ -22,6 +22,14 @@ interface WorkerResult {
     log?: string;
 }
 
+// Helper to strip unwanted strings from messages
+function cleanMessage(text: string): string {
+    return text
+        .replace(/📷TlkInst/g, '')
+        .replace(/🎞Канал со стримами/g, '')
+        .trim();
+}
+
 // Helper to filter messages based on database dictionary
 async function shouldSendMessage(text: string): Promise<boolean> {
     const lowerText = text.toLowerCase();
@@ -140,6 +148,8 @@ export class Scraper {
         for (const msg of messages) {
             const telegramIdBigInt = BigInt(msg.telegramId);
 
+            const cleanedText = cleanMessage(msg.text);
+
             const existing = await prisma.message.findFirst({
                 where: {
                     telegramId: telegramIdBigInt,
@@ -152,7 +162,7 @@ export class Scraper {
                     const saved = await prisma.message.create({
                         data: {
                             telegramId: telegramIdBigInt,
-                            message: msg.text,
+                            message: cleanedText,
                             date: msg.date,
                             sent: false,
                             channelId: channelId
@@ -161,7 +171,7 @@ export class Scraper {
                     logger.info(`Saved message ${saved.id} (TG: ${msg.telegramId})`, channelId);
 
                     // --- DB-DRIVEN DICTIONARY FILTERING ---
-                    if (!(await shouldSendMessage(msg.text))) {
+                    if (!(await shouldSendMessage(cleanedText))) {
                         logger.info(`Message ${msg.telegramId} filtered out by DB dictionary rules.`, channelId);
                         continue;
                     }
@@ -183,7 +193,7 @@ export class Scraper {
                             timeZone: 'Europe/Kyiv'
                         });
                         const header = `📢 *${channelInfo?.name || channelInfo?.link}* (Received: ${receivedTime})\n\n`;
-                        const outMessage = header + msg.text;
+                        const outMessage = header + cleanedText;
 
                         for (const user of subscribers) {
                             try {
