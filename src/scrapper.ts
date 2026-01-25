@@ -149,9 +149,10 @@ export class Scraper {
     }
 
     private async processMessages(channelId: number, messages: ScrapedMessage[]) {
+        const { bot } = await import('./bot');
+
         for (const msg of messages) {
             const telegramIdBigInt = BigInt(msg.telegramId);
-
             const cleanedText = cleanMessage(msg.text);
 
             const existing = await prisma.message.findFirst({
@@ -161,20 +162,37 @@ export class Scraper {
                 }
             });
 
-            if (!existing) {
+            // Check if this is an edit of an existing message
+            const isEdit = existing && (existing.message !== cleanedText || existing.mediaUrl !== (msg.mediaUrl || null));
+
+            if (!existing || isEdit) {
                 try {
-                    const saved = await prisma.message.create({
-                        data: {
-                            telegramId: telegramIdBigInt,
-                            message: cleanedText,
-                            mediaUrl: msg.mediaUrl,
-                            mediaType: msg.mediaType,
-                            date: msg.date,
-                            sent: false,
-                            channelId: channelId
-                        }
-                    });
-                    logger.info(`Saved message ${saved.id} (TG: ${msg.telegramId})`, channelId);
+                    let saved;
+                    if (isEdit) {
+                        saved = await prisma.message.update({
+                            where: { id: existing!.id },
+                            data: {
+                                message: cleanedText,
+                                mediaUrl: msg.mediaUrl,
+                                mediaType: msg.mediaType,
+                                updatedAt: new Date()
+                            }
+                        });
+                        logger.info(`Updated edited message ${saved.id} (TG: ${msg.telegramId})`, channelId);
+                    } else {
+                        saved = await prisma.message.create({
+                            data: {
+                                telegramId: telegramIdBigInt,
+                                message: cleanedText,
+                                mediaUrl: msg.mediaUrl,
+                                mediaType: msg.mediaType,
+                                date: msg.date,
+                                sent: false,
+                                channelId: channelId
+                            }
+                        });
+                        logger.info(`Saved message ${saved.id} (TG: ${msg.telegramId})`, channelId);
+                    }
 
                     // --- DB-DRIVEN DICTIONARY FILTERING ---
                     if (!(await shouldSendMessage(cleanedText))) {
@@ -200,10 +218,12 @@ export class Scraper {
                         });
 
                         const channelName = channelInfo?.name || channelInfo?.link || 'Alert';
+                        const statusEmoji = isEdit ? '📝' : '🔔';
+                        const editLabel = isEdit ? ' *(ОНОВЛЕНО)*' : '';
 
-                        // Professional, high-readability layout
+                        // Professional layout with Edit awareness
                         const outMessage =
-                            `🔔 *${channelName}*\n` +
+                            `${statusEmoji} *${channelName}*${editLabel}\n` +
                             `⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n` +
                             `${cleanedText}\n` +
                             `⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n` +
@@ -211,7 +231,6 @@ export class Scraper {
 
                         for (const user of subscribers) {
                             try {
-                                const { bot } = await import('./bot');
                                 const targetUserId = Number(user.telegramId);
 
                                 if (msg.mediaUrl) {
