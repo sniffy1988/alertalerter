@@ -163,37 +163,20 @@ export class Scraper {
                 }
             });
 
-            // Check if this is an edit of an existing message
-            const isEdit = existing && (existing.message !== cleanedText || existing.mediaUrl !== (msg.mediaUrl || null));
-
-            if (!existing || isEdit) {
+            if (!existing) {
                 try {
-                    let saved;
-                    if (isEdit) {
-                        saved = await prisma.message.update({
-                            where: { id: existing!.id },
-                            data: {
-                                message: cleanedText,
-                                mediaUrl: msg.mediaUrl,
-                                mediaType: msg.mediaType,
-                                updatedAt: new Date()
-                            }
-                        });
-                        logger.info(`Updated edited message ${saved.id} (TG: ${msg.telegramId})`, channelId);
-                    } else {
-                        saved = await prisma.message.create({
-                            data: {
-                                telegramId: telegramIdBigInt,
-                                message: cleanedText,
-                                mediaUrl: msg.mediaUrl,
-                                mediaType: msg.mediaType,
-                                date: msg.date,
-                                sent: false,
-                                channelId: channelId
-                            }
-                        });
-                        logger.info(`Saved message ${saved.id} (TG: ${msg.telegramId})`, channelId);
-                    }
+                    const saved = await prisma.message.create({
+                        data: {
+                            telegramId: telegramIdBigInt,
+                            message: cleanedText,
+                            mediaUrl: msg.mediaUrl,
+                            mediaType: msg.mediaType,
+                            date: msg.date,
+                            sent: false,
+                            channelId: channelId
+                        }
+                    });
+                    logger.info(`Saved message ${saved.id} (TG: ${msg.telegramId})`, channelId);
 
                     // --- DB-DRIVEN DICTIONARY FILTERING ---
                     if (!(await shouldSendMessage(cleanedText))) {
@@ -219,12 +202,10 @@ export class Scraper {
                         });
 
                         const channelName = channelInfo?.name || channelInfo?.link || 'Alert';
-                        const statusEmoji = isEdit ? '📝' : '🔔';
-                        const editLabel = isEdit ? ' *(ОНОВЛЕНО)*' : '';
 
-                        // Professional layout with Edit awareness
+                        // Professional layout
                         const outMessage =
-                            `${statusEmoji} *${channelName}*${editLabel}\n` +
+                            `🔔 *${channelName}*\n` +
                             `⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n` +
                             `${cleanedText}\n` +
                             `⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n` +
