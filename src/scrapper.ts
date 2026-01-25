@@ -176,7 +176,12 @@ export class Scraper {
 
                     if (subscribers.length > 0) {
                         const channelInfo = await prisma.channel.findUnique({ where: { id: channelId } });
-                        const receivedTime = saved.createdAt.toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                        const receivedTime = saved.createdAt.toLocaleTimeString('uk-UA', {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            second: '2-digit',
+                            timeZone: 'Europe/Kyiv'
+                        });
                         const header = `📢 *${channelInfo?.name || channelInfo?.link}* (Received: ${receivedTime})\n\n`;
                         const outMessage = header + msg.text;
 
