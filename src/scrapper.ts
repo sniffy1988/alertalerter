@@ -25,9 +25,10 @@ interface WorkerResult {
 // Helper to strip unwanted strings and normalize text for better matching
 function cleanMessage(text: string): string {
     return text
-        .replace(/📷TlkInst/g, '')
-        .replace(/🎞Канал со стримами/g, '')
-        .replace(/[’ʼ]/g, "'") // Normalize apostrophes to standard single quote
+        .replace(/📷TlkInst/g, ' ')
+        .replace(/🎞Канал со стримами/g, ' ')
+        .replace(/[’ʼ]/g, "'") // Normalize apostrophes
+        .replace(/\s+/g, ' ')  // Collapse multiple spaces into one
         .trim();
 }
 
@@ -193,8 +194,16 @@ export class Scraper {
                             second: '2-digit',
                             timeZone: 'Europe/Kyiv'
                         });
-                        const header = `📢 *${channelInfo?.name || channelInfo?.link}* (Received: ${receivedTime})\n\n`;
-                        const outMessage = header + cleanedText;
+
+                        const channelName = channelInfo?.name || channelInfo?.link || 'Alert';
+
+                        // Professional, high-readability layout
+                        const outMessage =
+                            `🔔 *${channelName}*\n` +
+                            `⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n` +
+                            `${cleanedText}\n` +
+                            `⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n` +
+                            `🕒 ${receivedTime}`;
 
                         for (const user of subscribers) {
                             try {
