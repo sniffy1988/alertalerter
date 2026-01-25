@@ -9,6 +9,8 @@ const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 interface ScrapedMessage {
     telegramId: number;
     text: string;
+    mediaUrl?: string;
+    mediaType?: 'photo' | 'video';
     date: Date;
     sender?: string;
 }
@@ -165,6 +167,8 @@ export class Scraper {
                         data: {
                             telegramId: telegramIdBigInt,
                             message: cleanedText,
+                            mediaUrl: msg.mediaUrl,
+                            mediaType: msg.mediaType,
                             date: msg.date,
                             sent: false,
                             channelId: channelId
@@ -208,7 +212,27 @@ export class Scraper {
                         for (const user of subscribers) {
                             try {
                                 const { bot } = await import('./bot');
-                                await bot.api.sendMessage(Number(user.telegramId), outMessage, { parse_mode: 'Markdown' });
+                                const targetUserId = Number(user.telegramId);
+
+                                if (msg.mediaUrl) {
+                                    if (msg.mediaType === 'photo') {
+                                        await bot.api.sendPhoto(targetUserId, msg.mediaUrl, {
+                                            caption: outMessage,
+                                            parse_mode: 'Markdown'
+                                        });
+                                    } else if (msg.mediaType === 'video') {
+                                        await bot.api.sendVideo(targetUserId, msg.mediaUrl, {
+                                            caption: outMessage,
+                                            parse_mode: 'Markdown'
+                                        });
+                                    } else {
+                                        // Fallback for unknown media
+                                        await bot.api.sendMessage(targetUserId, outMessage, { parse_mode: 'Markdown' });
+                                    }
+                                } else {
+                                    // Regular text message
+                                    await bot.api.sendMessage(targetUserId, outMessage, { parse_mode: 'Markdown' });
+                                }
                             } catch (err) {
                                 logger.error(`Notification failed for user ${user.telegramId}`, channelId, { error: err });
                             }
