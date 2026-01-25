@@ -44,7 +44,13 @@ async function scrapeChannel(username: string): Promise<ScrapedMessage[]> {
         if (!dataId) return;
 
         const messageId = parseInt(dataId.split('/').pop() || '0', 10);
-        const text = msgNode.find('.tgme_widget_message_text').text().trim();
+
+        // Find text node and strip citations/replies
+        const textNode = msgNode.find('.tgme_widget_message_text');
+        textNode.find('.tgme_widget_message_reply').remove();
+        textNode.find('.tgme_widget_message_author_name').remove();
+
+        const text = textNode.text().trim();
         const timeStr = msgNode.find('time').attr('datetime');
 
         if (!text && !msgNode.find('.tgme_widget_message_photo').length) return;
