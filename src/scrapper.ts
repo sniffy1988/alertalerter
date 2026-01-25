@@ -29,8 +29,8 @@ function cleanMessage(text: string): string {
     return text
         .replace(/📷TlkInst/g, ' ')
         .replace(/🎞Канал со стримами/g, ' ')
-        .replace(/[’ʼ]/g, "'") // Normalize apostrophes
-        .replace(/\s+/g, ' ')  // Collapse multiple spaces into one
+        .replace(/[’ʼ]/g, "'")    // Normalize apostrophes
+        .replace(/[^\S\r\n]+/g, ' ') // Collapse spaces/tabs but KEEP newlines (\r\n)
         .trim();
 }
 

@@ -52,6 +52,9 @@ async function scrapeChannel(username: string): Promise<ScrapedMessage[]> {
         textNode.find('.tgme_widget_message_reply').remove();
         textNode.find('.tgme_widget_message_author_name').remove();
 
+        // Preserve line breaks
+        textNode.find('br').replaceWith('\n');
+
         const text = textNode.text().trim();
         const timeStr = msgNode.find('time').attr('datetime');
 
