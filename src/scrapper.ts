@@ -22,11 +22,12 @@ interface WorkerResult {
     log?: string;
 }
 
-// Helper to strip unwanted strings from messages
+// Helper to strip unwanted strings and normalize text for better matching
 function cleanMessage(text: string): string {
     return text
         .replace(/📷TlkInst/g, '')
         .replace(/🎞Канал со стримами/g, '')
+        .replace(/[’ʼ]/g, "'") // Normalize apostrophes to standard single quote
         .trim();
 }
 
