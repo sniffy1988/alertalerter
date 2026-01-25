@@ -203,13 +203,24 @@ export class Scraper {
 
                         const channelName = channelInfo?.name || channelInfo?.link || 'Alert';
 
-                        // Professional layout
+                        // Helper to escape MarkdownV2 special characters
+                        const esc = (text: string) => text.replace(/[_*[\]()~`>#+-=|{}.!]/g, '\\$&');
+
+                        const escapedName = esc(channelName);
+                        const escapedTime = esc(receivedTime);
+                        const escapedText = esc(cleanedText);
+
+                        // Premium Wide Quote layout (Style 1)
+                        // Prepend > to each line of text for a consistent blockquote
+                        const quotedText = escapedText
+                            .split('\n')
+                            .map(line => `>${line}`)
+                            .join('\n');
+
                         const outMessage =
-                            `🔔 *${channelName}*\n` +
-                            `⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n` +
-                            `${cleanedText}\n` +
-                            `⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n` +
-                            `🕒 ${receivedTime}`;
+                            `🔔 *${escapedName}*\n` +
+                            `${quotedText}\n\n` +
+                            `🕒 \`${escapedTime}\``;
 
                         for (const user of subscribers) {
                             try {
@@ -219,20 +230,18 @@ export class Scraper {
                                     if (msg.mediaType === 'photo') {
                                         await bot.api.sendPhoto(targetUserId, msg.mediaUrl, {
                                             caption: outMessage,
-                                            parse_mode: 'Markdown'
+                                            parse_mode: 'MarkdownV2'
                                         });
                                     } else if (msg.mediaType === 'video') {
                                         await bot.api.sendVideo(targetUserId, msg.mediaUrl, {
                                             caption: outMessage,
-                                            parse_mode: 'Markdown'
+                                            parse_mode: 'MarkdownV2'
                                         });
                                     } else {
-                                        // Fallback for unknown media
-                                        await bot.api.sendMessage(targetUserId, outMessage, { parse_mode: 'Markdown' });
+                                        await bot.api.sendMessage(targetUserId, outMessage, { parse_mode: 'MarkdownV2' });
                                     }
                                 } else {
-                                    // Regular text message
-                                    await bot.api.sendMessage(targetUserId, outMessage, { parse_mode: 'Markdown' });
+                                    await bot.api.sendMessage(targetUserId, outMessage, { parse_mode: 'MarkdownV2' });
                                 }
                             } catch (err) {
                                 logger.error(`Notification failed for user ${user.telegramId}`, channelId, { error: err });
