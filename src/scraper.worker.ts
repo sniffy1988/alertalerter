@@ -48,7 +48,7 @@ async function scrapeChannel(username: string): Promise<ScrapedMessage[]> {
         const messageId = parseInt(dataId.split('/').pop() || '0', 10);
 
         // Find text node and strip citations/replies
-        const textNode = msgNode.find('.tgme_widget_message_text');
+        const textNode = msgNode.find('.tgme_widget_message_text.js-message_text');
         textNode.find('.tgme_widget_message_reply').remove();
         textNode.find('.tgme_widget_message_author_name').remove();
 
