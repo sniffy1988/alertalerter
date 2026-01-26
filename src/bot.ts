@@ -407,8 +407,12 @@ bot.on('callback_query:data', async (ctx) => {
 bot.command('hit', async (ctx) => {
     const user = await prisma.user.findUnique({ where: { telegramId: BigInt(ctx.from!.id) } });
     if (!user?.isAdmin) return ctx.reply("⛔ Admin only.");
-    const phrase = ctx.match?.trim();
+    let phrase = ctx.match?.trim();
     if (!phrase) return ctx.reply("Usage: `/hit word`", { parse_mode: 'Markdown' });
+
+    // Normalize before storing to prevent duplicates (КАБ vs каб)
+    phrase = phrase.toLowerCase().replace(/[’ʼ]/g, "'").trim();
+
     try {
         await prisma.filterPhrase.upsert({ where: { phrase }, update: { exclude: false }, create: { phrase, exclude: false } });
         await ctx.reply(`✅ Added keyword: *${phrase}*`, { parse_mode: 'Markdown' });
@@ -418,8 +422,12 @@ bot.command('hit', async (ctx) => {
 bot.command('miss', async (ctx) => {
     const user = await prisma.user.findUnique({ where: { telegramId: BigInt(ctx.from!.id) } });
     if (!user?.isAdmin) return ctx.reply("⛔ Admin only.");
-    const phrase = ctx.match?.trim();
+    let phrase = ctx.match?.trim();
     if (!phrase) return ctx.reply("Usage: `/miss word`", { parse_mode: 'Markdown' });
+
+    // Normalize before storing
+    phrase = phrase.toLowerCase().replace(/[’ʼ]/g, "'").trim();
+
     try {
         await prisma.filterPhrase.upsert({ where: { phrase }, update: { exclude: true }, create: { phrase, exclude: true } });
         await ctx.reply(`🚫 Added exclusion: *${phrase}*`, { parse_mode: 'Markdown' });
