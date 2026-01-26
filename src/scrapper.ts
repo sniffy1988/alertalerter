@@ -27,9 +27,9 @@ interface WorkerResult {
 // Helper to strip unwanted strings and normalize text for better matching
 function cleanMessage(text: string): string {
     return text
-        .replace(/📷TlkInst/g, ' ')
-        .replace(/🎞Канал со стримами/g, ' ')
-        .replace(/✅ Підпишись на СХІД/g, ' ')
+        .replace(/📷TlkInst/gi, ' ')
+        .replace(/🎞Канал со стримами/gi, ' ')
+        .replace(/✅ Підпишись на СХІД/gi, ' ')
         .replace(/[’ʼ]/g, "'")    // Normalize apostrophes
         .replace(/[^\S\r\n]+/g, ' ') // Collapse spaces/tabs but KEEP newlines (\r\n)
         .trim();
@@ -159,112 +159,89 @@ export class Scraper {
     private async processMessages(channelId: number, messages: ScrapedMessage[]) {
         const { bot } = await import('./bot');
 
+        // 1. Pre-fetch everything needed for this batch in one go
+        const [channelInfo, subscribers, rules] = await Promise.all([
+            prisma.channel.findUnique({ where: { id: channelId } }),
+            prisma.user.findMany({
+                where: { subscribedTo: { some: { id: channelId } }, silentMode: false }
+            }),
+            prisma.filterPhrase.findMany()
+        ]);
+
+        if (!channelInfo) return;
+        const channelName = channelInfo.name || channelInfo.link || 'Alert';
+
+        // 2. Setup high-speed lookups
+        const normalize = (s: string) => s.toLowerCase().replace(/[’ʼ]/g, "'").trim();
+        const esc = (text: string) => text.replace(/[_*[\]()~`>#+-=|{}.!]/g, '\\$&');
+        const escapedName = esc(channelName);
+
+        const excludeRules = rules.filter(r => r.exclude).map(r => normalize(r.phrase));
+        const includeRules = rules.filter(r => !r.exclude).map(r => normalize(r.phrase));
+
+        // 3. BATCH DUPLICATE CHECK (Fetch all relevant IDs once)
+        const msgIds = messages.map(m => BigInt(m.telegramId));
+        const existingMessages = await prisma.message.findMany({
+            where: { channelId, telegramId: { in: msgIds } },
+            select: { telegramId: true }
+        });
+        const existingIdsSet = new Set(existingMessages.map(m => m.telegramId.toString()));
+
         for (const msg of messages) {
             const telegramIdBigInt = BigInt(msg.telegramId);
             const cleanedText = cleanMessage(msg.text);
+            const normalizedText = normalize(cleanedText);
 
-            const existing = await prisma.message.findFirst({
-                where: {
-                    telegramId: telegramIdBigInt,
-                    channelId: channelId
-                }
+            // 4. FAST FILTERING (In-Memory)
+            if (excludeRules.some(p => normalizedText.includes(p))) continue;
+            if (!includeRules.some(p => normalizedText.includes(p))) continue;
+
+            // 5. DUPLICATE CHECK (In-Memory Set lookup)
+            if (existingIdsSet.has(msg.telegramId.toString())) continue;
+
+            // 6. BROADCAST PREP
+            const now = new Date();
+            const receivedTime = now.toLocaleTimeString('uk-UA', {
+                hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Europe/Kyiv'
             });
 
-            if (!existing) {
+            const escapedText = esc(cleanedText);
+            const quotedText = escapedText.split('\n').map(line => `>${line}`).join('\n');
+            const outMessage = `🔔 *${escapedName}*\n${quotedText}\n\n🕒 \`${esc(receivedTime)}\``;
+
+            // 7. HOT PATH: TRIGGER BROADCASTS (Parallel)
+            const sendPromises = subscribers.map(user => {
+                const targetUserId = Number(user.telegramId);
+                const options = { caption: outMessage, parse_mode: 'MarkdownV2' as const };
+
+                if (msg.mediaUrl) {
+                    if (msg.mediaType === 'photo') return bot.api.sendPhoto(targetUserId, msg.mediaUrl, options).catch(() => { });
+                    if (msg.mediaType === 'video') return bot.api.sendVideo(targetUserId, msg.mediaUrl, options).catch(() => { });
+                }
+                return bot.api.sendMessage(targetUserId, outMessage, { parse_mode: 'MarkdownV2' }).catch(() => { });
+            });
+
+            // Fire-and-forget: Start broadcasting immediately
+            Promise.all(sendPromises).then(async () => {
+                // Background DB Logging - doesn't block the next message in the loop
                 try {
-                    const saved = await prisma.message.create({
+                    await prisma.message.create({
                         data: {
                             telegramId: telegramIdBigInt,
                             message: cleanedText,
                             mediaUrl: msg.mediaUrl,
                             mediaType: msg.mediaType,
                             date: msg.date,
-                            sent: false,
+                            sent: true,
                             channelId: channelId
                         }
                     });
-                    logger.info(`Saved message ${saved.id} (TG: ${msg.telegramId})`, channelId);
-
-                    // --- DB-DRIVEN DICTIONARY FILTERING ---
-                    if (!(await shouldSendMessage(cleanedText))) {
-                        logger.info(`Message ${msg.telegramId} filtered out by DB dictionary rules.`, channelId);
-                        continue;
-                    }
-
-                    // --- BROADCAST TO SUBSCRIBERS ---
-                    const subscribers = await prisma.user.findMany({
-                        where: {
-                            subscribedTo: { some: { id: channelId } },
-                            silentMode: false
-                        }
-                    });
-
-                    if (subscribers.length > 0) {
-                        const channelInfo = await prisma.channel.findUnique({ where: { id: channelId } });
-                        const receivedTime = saved.createdAt.toLocaleTimeString('uk-UA', {
-                            hour: '2-digit',
-                            minute: '2-digit',
-                            second: '2-digit',
-                            timeZone: 'Europe/Kyiv'
-                        });
-
-                        const channelName = channelInfo?.name || channelInfo?.link || 'Alert';
-
-                        // Helper to escape MarkdownV2 special characters
-                        const esc = (text: string) => text.replace(/[_*[\]()~`>#+-=|{}.!]/g, '\\$&');
-
-                        const escapedName = esc(channelName);
-                        const escapedTime = esc(receivedTime);
-                        const escapedText = esc(cleanedText);
-
-                        // Premium Wide Quote layout (Style 1)
-                        // Prepend > to each line of text for a consistent blockquote
-                        const quotedText = escapedText
-                            .split('\n')
-                            .map(line => `>${line}`)
-                            .join('\n');
-
-                        const outMessage =
-                            `🔔 *${escapedName}*\n` +
-                            `${quotedText}\n\n` +
-                            `🕒 \`${escapedTime}\``;
-
-                        for (const user of subscribers) {
-                            try {
-                                const targetUserId = Number(user.telegramId);
-
-                                if (msg.mediaUrl) {
-                                    if (msg.mediaType === 'photo') {
-                                        await bot.api.sendPhoto(targetUserId, msg.mediaUrl, {
-                                            caption: outMessage,
-                                            parse_mode: 'MarkdownV2'
-                                        });
-                                    } else if (msg.mediaType === 'video') {
-                                        await bot.api.sendVideo(targetUserId, msg.mediaUrl, {
-                                            caption: outMessage,
-                                            parse_mode: 'MarkdownV2'
-                                        });
-                                    } else {
-                                        await bot.api.sendMessage(targetUserId, outMessage, { parse_mode: 'MarkdownV2' });
-                                    }
-                                } else {
-                                    await bot.api.sendMessage(targetUserId, outMessage, { parse_mode: 'MarkdownV2' });
-                                }
-                            } catch (err) {
-                                logger.error(`Notification failed for user ${user.telegramId}`, channelId, { error: err });
-                            }
-                        }
-
-                        await prisma.message.update({
-                            where: { id: saved.id },
-                            data: { sent: true }
-                        });
-                    }
-
                 } catch (e) {
-                    logger.error(`Skipped msg ${msg.telegramId} due to error:`, channelId, { error: e });
+                    // Fail silently for DB errors on hot path logging
                 }
-            }
+            });
+
+            logger.info(`🚨 Speed Broadcast: Alert triggered for ${msg.telegramId}`, channelId);
         }
     }
 }
