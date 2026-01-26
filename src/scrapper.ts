@@ -37,17 +37,24 @@ function cleanMessage(text: string): string {
 
 // Helper to filter messages based on database dictionary
 async function shouldSendMessage(text: string): Promise<boolean> {
-    const lowerText = text.toLowerCase();
+    // Normalization helper for consistent matching
+    const normalize = (s: string) =>
+        s.toLowerCase()
+            .replace(/[’ʼ]/g, "'")
+            .trim();
+
+    const normalizedText = normalize(text);
 
     // Fetch all rules from DB
     const rules = await prisma.filterPhrase.findMany();
 
     // 1. Check for ANY exclusion matches - if found, block immediately.
-    const hasExclude = rules.some(p => p.exclude && lowerText.includes(p.phrase.toLowerCase()));
+    // We normalize rule phrases during check to handle inconsistent DB entries.
+    const hasExclude = rules.some(p => p.exclude && normalizedText.includes(normalize(p.phrase)));
     if (hasExclude) return false;
 
     // 2. Check for AT LEAST ONE inclusion match - if found, allow.
-    const hasInclude = rules.some(p => !p.exclude && lowerText.includes(p.phrase.toLowerCase()));
+    const hasInclude = rules.some(p => !p.exclude && normalizedText.includes(normalize(p.phrase)));
     return hasInclude;
 }
 
