@@ -29,7 +29,7 @@ function cleanMessage(text: string): string {
     return text
         .replace(/📷TlkInst/gi, ' ')
         .replace(/🎞Канал со стримами/gi, ' ')
-        .replace(/✅ Підпишись на СХІД/gi, ' ')
+        .replace(/✅ Підпишись на СХІ[ДD]/gi, ' ')
         .replace(/[’ʼ]/g, "'")    // Normalize apostrophes
         .replace(/[^\S\r\n]+/g, ' ') // Collapse spaces/tabs but KEEP newlines (\r\n)
         .trim();
