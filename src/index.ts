@@ -2,6 +2,11 @@ import 'dotenv/config';
 import http from 'http';
 import { bot, notifyAdminsBotAlive } from './bot';
 import { Scraper } from './scrapper';
+import { registerAlertSender } from './alertSender';
+
+// Flow: App starts → Scraper runs its own cycle per channel → Messages written to DB →
+//       If message should be sent (filter match), fire event with send data →
+//       Bot is notified by event and sends message to subscribers.
 
 async function main() {
     console.log('Starting app...');
@@ -23,7 +28,10 @@ async function main() {
         }
     });
 
-    // 3. Start Scraper
+    // 3. Bot listens for scraper events and sends messages (event-driven)
+    registerAlertSender();
+
+    // 4. Scraper: runs its own cycle per channel; writes to DB; fires event when message should be sent
     const scraper = new Scraper(1);
     scraper.start();
 }

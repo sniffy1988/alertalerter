@@ -35,9 +35,12 @@ function cleanMessage(text: string): string {
         .trim();
 }
 
+/** One worker per channel; each channel has its own scrapTimeout (ms) from DB. */
 export class Scraper {
     private isRunning = false;
+    /** How often (seconds) we check which channels are due for a scrape. */
     private intervalSeconds: number;
+    /** One worker per channel id. */
     private workers: Map<number, Worker> = new Map();
 
     constructor(intervalSeconds: number = 2) {
@@ -50,15 +53,21 @@ export class Scraper {
         logger.info(`Scraper started with DB-driven filtering, triggering every ${this.intervalSeconds} seconds.`);
 
         await this.refreshWorkers();
+        // Run one cycle for each channel immediately on start
+        try {
+            await this.triggerScrapeCycle();
+        } catch (error) {
+            logger.error('Error during initial scrape cycle:', undefined, { error });
+        }
 
         while (this.isRunning) {
+            await this.refreshWorkers();
+            await delay(this.intervalSeconds * 1000);
             try {
                 await this.triggerScrapeCycle();
             } catch (error) {
                 logger.error('Error during scrape cycle:', undefined, { error });
             }
-            await this.refreshWorkers();
-            await delay(this.intervalSeconds * 1000);
         }
     }
 
@@ -115,6 +124,7 @@ export class Scraper {
 
         const toScrape: typeof channels = [];
         for (const channel of channels) {
+            // Each channel has its own timeout (scrapTimeout in ms)
             const lastScrape = channel.lastScrapedAt ? new Date(channel.lastScrapedAt).getTime() : 0;
             const elapsed = now.getTime() - lastScrape;
             if (elapsed >= channel.scrapTimeout) {
@@ -135,7 +145,7 @@ export class Scraper {
     }
 
     private async processMessages(channelId: number, messages: ScrapedMessage[]) {
-        const { bot } = await import('./bot');
+        const { emitAlerts } = await import('./alertBus');
 
         // 1. Pre-fetch everything needed for this batch in one go
         const [channelInfo, subscribers, rules] = await Promise.all([
@@ -202,25 +212,7 @@ export class Scraper {
             prepared.push({ outMessage, mediaUrl: msg.mediaUrl, mediaType: msg.mediaType, telegramId: msg.telegramId });
         }
 
-        // 5. SEND: fire all sends in parallel (all messages × all subscribers at once)
-        if (prepared.length > 0 && subscribers.length > 0) {
-            const options = { parse_mode: 'MarkdownV2' as const };
-            const allSends = prepared.flatMap(p =>
-                subscribers.map(user => {
-                    const chatId = Number(user.telegramId);
-                    const opts = { ...options, caption: p.outMessage };
-                    if (p.mediaUrl) {
-                        if (p.mediaType === 'photo') return bot.api.sendPhoto(chatId, p.mediaUrl, opts).catch(() => { });
-                        if (p.mediaType === 'video') return bot.api.sendVideo(chatId, p.mediaUrl, opts).catch(() => { });
-                    }
-                    return bot.api.sendMessage(chatId, p.outMessage, options).catch(() => { });
-                })
-            );
-            await Promise.all(allSends);
-            prepared.forEach(p => logger.info(`🚨 Speed Broadcast: Alert triggered for ${p.telegramId}`, channelId));
-        }
-
-        // 6. PERSIST: save all scraped messages (sent = true only for those broadcast)
+        // 5. PERSIST first (scraper is independent of Telegram)
         if (allMessagesToPersist.length > 0) {
             try {
                 await prisma.message.createMany({
@@ -237,6 +229,17 @@ export class Scraper {
             } catch (e) {
                 // Fail silently for DB errors on logging
             }
+        }
+
+        // 6. EMIT alerts for sender to deliver (non-blocking; scraper does not wait)
+        if (prepared.length > 0 && subscribers.length > 0) {
+            emitAlerts({
+                channelId,
+                channelName,
+                items: prepared.map(p => ({ outMessage: p.outMessage, mediaUrl: p.mediaUrl, mediaType: p.mediaType, telegramId: p.telegramId })),
+                subscriberIds: subscribers.map(s => s.telegramId)
+            });
+            prepared.forEach(p => logger.info(`🚨 Alert queued for ${p.telegramId}`, channelId));
         }
     }
 }
