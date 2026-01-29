@@ -165,17 +165,32 @@ export class Scraper {
         });
         const existingIdsSet = new Set(existingMessages.map(m => m.telegramId.toString()));
 
-        const messagesToPersist: { telegramId: bigint; message: string; mediaUrl?: string; mediaType?: string; date: Date; channelId: number }[] = [];
+        type MessageRow = { telegramId: bigint; message: string; mediaUrl?: string; mediaType?: string; date: Date; channelId: number; sent: boolean };
+        const allMessagesToPersist: MessageRow[] = [];
         type Prepared = { outMessage: string; mediaUrl?: string; mediaType?: 'photo' | 'video'; telegramId: number };
         const prepared: Prepared[] = [];
 
-        // 4. PREPARE: filter and build payloads for all messages (no I/O)
+        // 4. PREPARE: save all new messages (with sent flag); build payloads for alerts only
         for (const msg of messages) {
+            if (existingIdsSet.has(msg.telegramId.toString())) continue;
+
             const cleanedText = cleanMessage(msg.text);
             const normalizedText = normalize(cleanedText);
-            if (excludeRules.some(p => normalizedText.includes(p))) continue;
-            if (!includeRules.some(p => normalizedText.includes(p))) continue;
-            if (existingIdsSet.has(msg.telegramId.toString())) continue;
+            const passedFilter =
+                !excludeRules.some(p => normalizedText.includes(p)) &&
+                includeRules.some(p => normalizedText.includes(p));
+
+            allMessagesToPersist.push({
+                telegramId: BigInt(msg.telegramId),
+                message: cleanedText,
+                mediaUrl: msg.mediaUrl,
+                mediaType: msg.mediaType,
+                date: msg.date,
+                channelId,
+                sent: passedFilter
+            });
+
+            if (!passedFilter) continue;
 
             const now = new Date();
             const receivedTime = now.toLocaleTimeString('uk-UA', {
@@ -184,15 +199,6 @@ export class Scraper {
             const escapedText = esc(cleanedText);
             const quotedText = escapedText.split('\n').map(line => `>${line}`).join('\n');
             const outMessage = `🔔 *${escapedName}*\n${quotedText}\n\n🕒 \`${esc(receivedTime)}\``;
-
-            messagesToPersist.push({
-                telegramId: BigInt(msg.telegramId),
-                message: cleanedText,
-                mediaUrl: msg.mediaUrl,
-                mediaType: msg.mediaType,
-                date: msg.date,
-                channelId
-            });
             prepared.push({ outMessage, mediaUrl: msg.mediaUrl, mediaType: msg.mediaType, telegramId: msg.telegramId });
         }
 
@@ -214,17 +220,17 @@ export class Scraper {
             prepared.forEach(p => logger.info(`🚨 Speed Broadcast: Alert triggered for ${p.telegramId}`, channelId));
         }
 
-        // 6. PERSIST: single batch insert
-        if (messagesToPersist.length > 0) {
+        // 6. PERSIST: save all scraped messages (sent = true only for those broadcast)
+        if (allMessagesToPersist.length > 0) {
             try {
                 await prisma.message.createMany({
-                    data: messagesToPersist.map(m => ({
+                    data: allMessagesToPersist.map(m => ({
                         telegramId: m.telegramId,
                         message: m.message,
                         mediaUrl: m.mediaUrl,
                         mediaType: m.mediaType,
                         date: m.date,
-                        sent: true,
+                        sent: m.sent,
                         channelId: m.channelId
                     }))
                 });
