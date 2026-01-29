@@ -381,13 +381,13 @@ bot.on('callback_query:data', async (ctx) => {
             if (!userWithSubs) return;
 
             const isSubscribed = userWithSubs.subscribedTo.some(c => (c as any).id === channelId);
-            await prisma.user.update({
+            const updatedUser = await prisma.user.update({
                 where: { telegramId: userId },
-                data: { subscribedTo: isSubscribed ? { disconnect: { id: channelId } } : { connect: { id: channelId } } }
+                data: { subscribedTo: isSubscribed ? { disconnect: { id: channelId } } : { connect: { id: channelId } } },
+                include: { subscribedTo: true }
             });
             await ctx.answerCallbackQuery(isSubscribed ? 'Unsubscribed' : 'Subscribed');
 
-            const updatedUser = await prisma.user.findUnique({ where: { telegramId: userId }, include: { subscribedTo: true } });
             const allChannels = await prisma.channel.findMany();
             const keyboard = new InlineKeyboard();
             for (const channel of allChannels) {
