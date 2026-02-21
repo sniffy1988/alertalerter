@@ -1,6 +1,45 @@
-import { parentPort, workerData } from 'worker_threads';
+import http from 'http';
+import https from 'https';
+import { parentPort } from 'worker_threads';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
+
+const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
+
+const axiosInstance = axios.create({
+    timeout: 10000,
+    headers: { 'User-Agent': USER_AGENT },
+    httpAgent: new http.Agent({ keepAlive: true }),
+    httpsAgent: new https.Agent({ keepAlive: true })
+} as Parameters<typeof axios.create>[0]);
+
+function isRetryable(err: unknown): boolean {
+    const e = err as { response?: { status?: number }; code?: string };
+    if (e && typeof e === 'object') {
+        const status = e.response?.status;
+        if (status != null && status >= 500 && status < 600) return true;
+        if (e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT' || e.code === 'ECONNABORTED') return true;
+    }
+    return err instanceof Error && (('code' in err) || err.message.includes('timeout'));
+}
+
+async function fetchWithRetry(url: string, maxAttempts = 3): Promise<string> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            const response = await axiosInstance.get(url);
+            return response.data as string;
+        } catch (err) {
+            lastError = err;
+            if (attempt < maxAttempts && isRetryable(err)) {
+                await new Promise(r => setTimeout(r, 500 * attempt));
+            } else {
+                throw err;
+            }
+        }
+    }
+    throw lastError;
+}
 
 // Types (replicated here or imported if shared)
 interface ScrapedMessage {
@@ -29,14 +68,8 @@ interface WorkerResult {
 // Function to scrape a single channel
 async function scrapeChannel(username: string): Promise<ScrapedMessage[]> {
     const url = `https://t.me/s/${username}`;
-    const response = await axios.get(url, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        },
-        timeout: 10000
-    });
-
-    const $ = cheerio.load(response.data as string);
+    const html = await fetchWithRetry(url);
+    const $ = cheerio.load(html);
     const messages: ScrapedMessage[] = [];
 
     $('.tgme_widget_message_wrap').each((_, element) => {
