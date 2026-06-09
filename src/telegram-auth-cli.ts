@@ -11,16 +11,36 @@ async function main() {
     const client = new TelegramClient(session, apiId, apiHash, { connectionRetries: 5 });
 
     console.log('Telegram user auth — use a dedicated or personal account.');
-    console.log('You will receive a login code in the Telegram app.\n');
+    console.log('You will receive a login code in the Telegram app.');
+    if (process.env.TELEGRAM_2FA_PASSWORD) {
+        console.log('Using TELEGRAM_2FA_PASSWORD from environment for 2FA.\n');
+    } else {
+        console.log('If your account has 2FA, you will be asked for your cloud password.\n');
+    }
 
     await client.start({
         phoneNumber: async () => await input.text('Phone number (international, e.g. +380...): '),
-        password: async () => {
-            const p = await input.text('2FA password (leave empty if none): ');
-            return p || '';
+        password: async (hint?: string) => {
+            const fromEnv = process.env.TELEGRAM_2FA_PASSWORD?.trim();
+            if (fromEnv) return fromEnv;
+
+            const prompt = hint
+                ? `2FA cloud password (hint: ${hint}): `
+                : '2FA cloud password: ';
+            const p = await input.text(prompt);
+            if (!p) {
+                throw new Error(
+                    'This account has 2FA enabled. Enter your Telegram cloud password ' +
+                    '(Settings → Privacy → Two-Step Verification). Empty is not allowed.'
+                );
+            }
+            return p;
         },
         phoneCode: async () => await input.text('Code from Telegram: '),
-        onError: (err) => console.error(err)
+        onError: async (err) => {
+            console.error(err);
+            return false;
+        }
     });
 
     const saved = session.save();
