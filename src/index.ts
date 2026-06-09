@@ -3,16 +3,15 @@ import http from 'http';
 import { bot, notifyAdminsBotAlive } from './bot';
 import { Scraper } from './scrapper';
 import { registerAlertSender } from './alertSender';
-
-// Flow: App starts → Scraper runs its own cycle per channel → Messages written to DB →
-//       If message should be sent (filter match), fire event with send data →
-//       Bot is notified by event and sends message to subscribers.
+import { MessageProcessor } from './messageProcessor';
+import { TelegramListener } from './telegramListener';
+import { getIngestMode } from './telegramConfig';
+import { logger } from './logger';
 
 async function main() {
     console.log('Starting app...');
 
-    // 1. Start Healthcheck Server (for Docker)
-    const healthServer = http.createServer((req, res) => {
+    const healthServer = http.createServer((_req, res) => {
         res.writeHead(200);
         res.end('OK');
     });
@@ -20,7 +19,6 @@ async function main() {
         console.log('Healthcheck server running on port 8080');
     });
 
-    // 2. Start Bot (Long Polling)
     bot.start({
         onStart: async (info) => {
             console.log(`Bot started as @${info.username}`);
@@ -28,12 +26,28 @@ async function main() {
         }
     });
 
-    // 3. Bot listens for scraper events and sends messages (event-driven)
     registerAlertSender();
 
-    // 4. Scraper: runs its own cycle per channel; writes to DB; fires event when message should be sent
-    const scraper = new Scraper(0.2);
-    scraper.start();
+    const processor = new MessageProcessor();
+    const ingestMode = getIngestMode();
+    let listener: TelegramListener | null = null;
+
+    if (ingestMode === 'mtproto') {
+        listener = new TelegramListener(processor);
+        try {
+            await listener.start();
+        } catch (err) {
+            logger.error('MTProto listener failed to start — using t.me fallback only', undefined, { error: err });
+            listener = null;
+        }
+    } else {
+        logger.info('Ingest mode: t.me scrape only (set TELEGRAM_API_ID/HASH/SESSION for MTProto)');
+    }
+
+    const scraper = new Scraper(0.2, processor, {
+        enabled: () => !listener?.isHealthy()
+    });
+    void scraper.start();
 }
 
 main().catch((err) => {

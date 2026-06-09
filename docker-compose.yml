@@ -13,6 +13,11 @@ services:
     environment:
       - DATABASE_URL=file:/database/alerts.db
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_USER_SESSION=${TELEGRAM_USER_SESSION}
+      - TELEGRAM_SESSION_PATH=/database/telegram.session
+      - INGEST_MODE=${INGEST_MODE:-auto}
       - NODE_ENV=production
       - LOG_LEVEL=info
     volumes:
