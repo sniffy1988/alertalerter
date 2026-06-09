@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions';
 import input from 'input';
-import { getApiCredentials } from '../src/telegramConfig';
+import { getApiCredentials, persistSession } from './telegramConfig';
 
 async function main() {
     const { apiId, apiHash } = getApiCredentials();
@@ -17,18 +17,25 @@ async function main() {
         phoneNumber: async () => await input.text('Phone number (international, e.g. +380...): '),
         password: async () => {
             const p = await input.text('2FA password (leave empty if none): ');
-            return p || undefined;
+            return p || '';
         },
         phoneCode: async () => await input.text('Code from Telegram: '),
         onError: (err) => console.error(err)
     });
 
-    const saved = client.session.save();
+    const saved = session.save();
     console.log('\n--- Session string (save securely) ---\n');
     console.log(saved);
-    console.log('\n--- Add to .env or docker-compose ---\n');
+    console.log('\n--- Add to Portainer env ---\n');
     console.log(`TELEGRAM_USER_SESSION=${saved}`);
-    console.log('\nOr write to file and set TELEGRAM_SESSION_PATH=/database/telegram.session');
+
+    const sessionPath = process.env.TELEGRAM_SESSION_PATH?.trim();
+    if (sessionPath) {
+        persistSession(saved);
+        console.log(`\nSession also written to ${sessionPath}`);
+    } else {
+        console.log('\nOr set TELEGRAM_SESSION_PATH=/database/telegram.session to save on volume');
+    }
 
     await client.disconnect();
 }
