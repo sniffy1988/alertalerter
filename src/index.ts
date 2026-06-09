@@ -44,9 +44,7 @@ async function main() {
         logger.info('Ingest mode: t.me scrape only (set TELEGRAM_API_ID/HASH/SESSION for MTProto)');
     }
 
-    const scraper = new Scraper(0.2, processor, {
-        enabled: () => !listener?.isHealthy()
-    });
+    const scraper = new Scraper(0.2, processor);
     void scraper.start();
 }
 

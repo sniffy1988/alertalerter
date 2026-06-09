@@ -59,7 +59,7 @@ export class Scraper {
         if (this.isRunning) return;
         this.isRunning = true;
         logger.info(
-            `Scraper ready (pool ${Scraper.POOL_SIZE}, poll ${this.intervalSeconds * 1000}ms, t.me fallback)`
+            `Scraper ready (pool ${Scraper.POOL_SIZE}, poll ${this.intervalSeconds * 1000}ms, parallel with MTProto)`
         );
 
         await this.refreshChannelCache();
