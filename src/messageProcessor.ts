@@ -76,11 +76,11 @@ export class MessageProcessor {
         channelId: number,
         messages: IncomingMessage[],
         source: IngestSource
-    ): Promise<void> {
-        if (messages.length === 0) return;
+    ): Promise<{ processed: number; persisted: number }> {
+        if (messages.length === 0) return { processed: 0, persisted: 0 };
 
         const channel = await prisma.channel.findUnique({ where: { id: channelId } });
-        if (!channel) return;
+        if (!channel) return { processed: 0, persisted: 0 };
 
         const channelName = channel.name || channel.link || 'Alert';
         await this.ensureRulesFresh();
@@ -219,9 +219,12 @@ export class MessageProcessor {
                 logger.info(`Persisted ${results.length} message(s) (${source})`, channelId, {
                     attempted: allMessagesToPersist.length
                 });
+                return { processed: messages.length, persisted: results.length };
             } catch (e) {
                 logger.error(`Failed to persist messages (${source})`, channelId, { error: e });
             }
         }
+
+        return { processed: messages.length, persisted: 0 };
     }
 }

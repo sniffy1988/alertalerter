@@ -26,7 +26,7 @@ type PoolEntry = { worker: Worker; busy: boolean; currentJob?: ScrapeJob };
 type CachedChannel = { id: number; link: string; lastScrapedAt: Date | null; scrapTimeout: number; name: string | null };
 
 export type ScraperOptions = {
-    /** When false, scraper idles (MTProto primary). When true, t.me fallback runs. */
+    /** When false, scraper idles (MTProto-only mode). Default: always run. */
     enabled?: () => boolean;
 };
 
@@ -40,7 +40,6 @@ export class Scraper {
     private channelCache = new Map<number, CachedChannel>();
     private failureBackoffUntil = new Map<number, number>();
     private enabled: () => boolean;
-    private fallbackActiveLogged = false;
     private static readonly POOL_SIZE = Math.min(8, Math.max(1, 2 * os.cpus().length));
     private static readonly FAILURE_BACKOFF_MS = 500;
     private static readonly MIN_SLEEP_MS = 50;
@@ -67,10 +66,6 @@ export class Scraper {
 
         while (this.isRunning) {
             if (this.enabled()) {
-                if (!this.fallbackActiveLogged) {
-                    logger.warn('t.me fallback scraper active (MTProto unavailable)');
-                    this.fallbackActiveLogged = true;
-                }
                 try {
                     await this.triggerScrapeCycle();
                 } catch (error) {
@@ -78,10 +73,6 @@ export class Scraper {
                 }
                 await delay(this.computeSleepMs());
             } else {
-                if (this.fallbackActiveLogged) {
-                    logger.info('t.me fallback scraper idle (MTProto healthy)');
-                    this.fallbackActiveLogged = false;
-                }
                 await delay(Scraper.IDLE_SLEEP_MS);
             }
         }
@@ -104,9 +95,57 @@ export class Scraper {
 
     private scheduleNextCycle(): void {
         if (!this.enabled()) return;
-        this.triggerScrapeCycle().catch(error =>
+        void this.triggerScrapeCycle().catch(error =>
             logger.error('Error during scheduled scrape cycle:', undefined, { error })
         );
+    }
+
+    private markScrapeSuccess(channelId: number): void {
+        const now = new Date();
+        const cached = this.channelCache.get(channelId);
+        if (cached) {
+            cached.lastScrapedAt = now;
+        }
+        void prisma.channel.update({
+            where: { id: channelId },
+            data: { lastScrapedAt: now }
+        }).catch(err =>
+            logger.error('Failed to update lastScrapedAt', channelId, { error: err })
+        );
+    }
+
+    private handleWorkerResult(entry: PoolEntry, result: WorkerResult) {
+        this.inFlight.delete(result.channelId);
+        entry.busy = false;
+        entry.currentJob = undefined;
+
+        if (result.success && result.messages) {
+            this.failureBackoffUntil.delete(result.channelId);
+            this.markScrapeSuccess(result.channelId);
+
+            void this.processor.processIncomingMessages(result.channelId, result.messages, 'scrape')
+                .then(({ persisted }) => {
+                    if (persisted > 0) {
+                        logger.info(`Scrape ingested ${persisted} new message(s)`, result.channelId, {
+                            username: result.username,
+                            fetched: result.messages!.length
+                        });
+                    } else {
+                        logger.debug('Scrape cycle: no new messages', result.channelId, {
+                            username: result.username,
+                            fetched: result.messages!.length
+                        });
+                    }
+                })
+                .catch(err =>
+                    logger.error('processMessages error', result.channelId, { error: err })
+                );
+        } else if (result.error) {
+            this.failureBackoffUntil.set(result.channelId, Date.now() + Scraper.FAILURE_BACKOFF_MS);
+            logger.error(`Worker error for ${result.username}:`, result.channelId, { error: result.error });
+        }
+
+        this.dispatchNext();
     }
 
     private async refreshChannelCache() {
@@ -179,39 +218,6 @@ export class Scraper {
         for (let i = 0; i < Scraper.POOL_SIZE; i++) {
             this.pool.push(this.createPoolWorker());
         }
-    }
-
-    private async markScrapeSuccess(channelId: number): Promise<void> {
-        await prisma.channel.update({
-            where: { id: channelId },
-            data: { lastScrapedAt: new Date() }
-        });
-        await this.refreshChannelCache();
-    }
-
-    private handleWorkerResult(entry: PoolEntry, result: WorkerResult) {
-        this.inFlight.delete(result.channelId);
-        entry.busy = false;
-        entry.currentJob = undefined;
-
-        if (result.success && result.messages) {
-            this.failureBackoffUntil.delete(result.channelId);
-            logger.info(`Scrape fetched ${result.messages.length} message(s)`, result.channelId, {
-                username: result.username
-            });
-            void this.markScrapeSuccess(result.channelId).catch(err =>
-                logger.error('Failed to update lastScrapedAt', result.channelId, { error: err })
-            );
-            this.processor.processIncomingMessages(result.channelId, result.messages, 'scrape').catch(err =>
-                logger.error('processMessages error', result.channelId, { error: err })
-            );
-        } else if (result.error) {
-            this.failureBackoffUntil.set(result.channelId, Date.now() + Scraper.FAILURE_BACKOFF_MS);
-            logger.error(`Worker error for ${result.username}:`, result.channelId, { error: result.error });
-        }
-
-        this.dispatchNext();
-        this.scheduleNextCycle();
     }
 
     private getIdleWorker(): PoolEntry | undefined {
