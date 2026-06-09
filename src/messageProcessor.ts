@@ -12,8 +12,6 @@ export type IncomingMessage = {
     sender?: string;
 };
 
-type CachedRule = { phrase: string; exclude: boolean };
-
 export function cleanMessage(text: string): string {
     return text
         .replace(/📷TlkInst/gi, ' ')
@@ -23,6 +21,13 @@ export function cleanMessage(text: string): string {
         .replace(/[^\S\r\n]+/g, ' ')
         .trim();
 }
+
+export function previewMessageText(text: string, max = 120): string {
+    const oneLine = text.replace(/\s+/g, ' ').trim();
+    return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine;
+}
+
+type CachedRule = { phrase: string; exclude: boolean };
 
 export class MessageProcessor {
     private rulesCache: CachedRule[] = [];
@@ -119,13 +124,23 @@ export class MessageProcessor {
 
         for (const msg of messages) {
             const idStr = msg.telegramId.toString();
-            if (existingIdsSet.has(idStr) || this.isRecentlyEmitted(channelId, msg.telegramId)) continue;
+            if (existingIdsSet.has(idStr) || this.isRecentlyEmitted(channelId, msg.telegramId)) {
+                logger.debug(`Skipped duplicate (${source})`, channelId, { telegramId: msg.telegramId });
+                continue;
+            }
 
             const cleanedText = cleanMessage(msg.text);
             const normalizedText = normalize(cleanedText);
             const passedFilter =
                 !excludeRules.some(p => normalizedText.includes(p)) &&
                 includeRules.some(p => normalizedText.includes(p));
+
+            logger.info(`New message (${source})`, channelId, {
+                telegramId: msg.telegramId,
+                preview: previewMessageText(cleanedText),
+                matchedFilter: passedFilter,
+                hasMedia: !!(msg.mediaUrl || msg.mediaType)
+            });
 
             allMessagesToPersist.push({
                 telegramId: BigInt(msg.telegramId),

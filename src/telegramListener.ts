@@ -5,7 +5,7 @@ import { Api } from 'telegram/tl';
 import { utils } from 'telegram';
 import prisma from './db';
 import { logger } from './logger';
-import { MessageProcessor, type IncomingMessage } from './messageProcessor';
+import { MessageProcessor, type IncomingMessage, previewMessageText } from './messageProcessor';
 import {
     getApiCredentials,
     loadSessionString,
@@ -170,6 +170,12 @@ export class TelegramListener {
                 text,
                 date: new Date(msg.date * 1000)
             };
+
+            logger.info('MTProto push received', mapping.channelId, {
+                channel: `@${mapping.username}`,
+                telegramId: msg.id,
+                preview: previewMessageText(text)
+            });
 
             await this.processor.processIncomingMessages(mapping.channelId, [incoming], 'mtproto');
         } catch (err) {

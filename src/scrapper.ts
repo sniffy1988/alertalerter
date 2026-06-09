@@ -196,6 +196,9 @@ export class Scraper {
 
         if (result.success && result.messages) {
             this.failureBackoffUntil.delete(result.channelId);
+            logger.info(`Scrape fetched ${result.messages.length} message(s)`, result.channelId, {
+                username: result.username
+            });
             void this.markScrapeSuccess(result.channelId).catch(err =>
                 logger.error('Failed to update lastScrapedAt', result.channelId, { error: err })
             );
