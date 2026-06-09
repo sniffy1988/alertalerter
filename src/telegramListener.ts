@@ -2,10 +2,10 @@ import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions';
 import { NewMessage, type NewMessageEvent } from 'telegram/events';
 import { Api } from 'telegram/tl';
-import { utils } from 'telegram';
 import prisma from './db';
 import { logger } from './logger';
 import { MessageProcessor, type IncomingMessage, previewMessageText } from './messageProcessor';
+import { peerIdAliases, resolvePeerIdFromEntity } from './telegramPeerId';
 import {
     getApiCredentials,
     loadSessionString,
@@ -19,6 +19,7 @@ export class TelegramListener {
     private healthy = false;
     private reconnectTimer: ReturnType<typeof setInterval> | null = null;
     private readonly peerToChannel = new Map<string, ChannelMapping>();
+    private watchedChannelCount = 0;
     private handlerRegistered = false;
     private readonly groupedSeen = new Set<string>();
     private readonly boundHandler: (event: NewMessageEvent) => Promise<void>;
@@ -83,16 +84,26 @@ export class TelegramListener {
         }
 
         this.healthy = true;
-        logger.info(`MTProto listener connected, watching ${this.peerToChannel.size} channel(s)`);
+        logger.info(`MTProto listener connected, watching ${this.watchedChannelCount} channel(s)`);
+    }
+
+    private registerChannelPeer(
+        peerId: string,
+        mapping: ChannelMapping
+    ): void {
+        for (const alias of peerIdAliases(peerId)) {
+            this.peerToChannel.set(alias, mapping);
+        }
     }
 
     private async setupChannels(): Promise<void> {
         if (!this.client) return;
 
         this.peerToChannel.clear();
+        this.watchedChannelCount = 0;
 
         const channels = await prisma.channel.findMany({
-            select: { id: true, link: true }
+            select: { id: true, link: true, telegramPeerId: true }
         });
 
         for (const ch of channels) {
@@ -101,21 +112,25 @@ export class TelegramListener {
                 const entity = await this.client.getEntity(username);
                 await this.tryJoinChannel(entity);
 
-                const peerId = utils.getPeerId(entity).toString();
-                const mapping: ChannelMapping = { channelId: ch.id, username };
-                this.peerToChannel.set(peerId, mapping);
-                if (entity instanceof Api.Channel) {
-                    this.peerToChannel.set(`-100${entity.id}`, mapping);
-                    this.peerToChannel.set(entity.id.toString(), mapping);
+                const peerId = ch.telegramPeerId || resolvePeerIdFromEntity(entity);
+                if (peerId !== ch.telegramPeerId) {
+                    await prisma.channel.update({
+                        where: { id: ch.id },
+                        data: { telegramPeerId: peerId }
+                    });
                 }
 
-                logger.info(`MTProto watching @${username}`, ch.id);
+                const mapping: ChannelMapping = { channelId: ch.id, username };
+                this.registerChannelPeer(peerId, mapping);
+                this.watchedChannelCount++;
+
+                logger.info(`MTProto watching @${username}`, ch.id, { telegramPeerId: peerId });
             } catch (err) {
                 logger.error(`Failed to subscribe MTProto channel @${username}`, ch.id, { error: err });
             }
         }
 
-        if (this.peerToChannel.size === 0) {
+        if (this.watchedChannelCount === 0) {
             throw new Error('No channels could be registered for MTProto ingest');
         }
     }
