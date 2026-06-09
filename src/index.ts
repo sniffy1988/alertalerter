@@ -32,7 +32,7 @@ async function main() {
     registerAlertSender();
 
     // 4. Scraper: runs its own cycle per channel; writes to DB; fires event when message should be sent
-    const scraper = new Scraper(1);
+    const scraper = new Scraper(0.2);
     scraper.start();
 }
 

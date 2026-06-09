@@ -78,8 +78,8 @@ const dictionary = [
 async function main() {
     // 1. Seed Channels
     const channels = [
-        { link: 'tlknewsua', name: 'TLK', timeout: 2500 },
-        { link: 'monitor1654', name: 'Монитор 1654', timeout: 2500 }
+        { link: 'tlknewsua', name: 'TLK', timeout: 1000 },
+        { link: 'monitor1654', name: 'Монитор 1654', timeout: 1000 }
     ];
 
     for (const c of channels) {

@@ -7,7 +7,7 @@ import * as cheerio from 'cheerio';
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
 
 const axiosInstance = axios.create({
-    timeout: 10000,
+    timeout: 5000,
     headers: { 'User-Agent': USER_AGENT },
     httpAgent: new http.Agent({ keepAlive: true }),
     httpsAgent: new https.Agent({ keepAlive: true })
@@ -32,7 +32,7 @@ async function fetchWithRetry(url: string, maxAttempts = 3): Promise<string> {
         } catch (err) {
             lastError = err;
             if (attempt < maxAttempts && isRetryable(err)) {
-                await new Promise(r => setTimeout(r, 500 * attempt));
+                await new Promise(r => setTimeout(r, 200 * attempt));
             } else {
                 throw err;
             }

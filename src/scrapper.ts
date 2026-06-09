@@ -4,7 +4,6 @@ import { Worker } from 'worker_threads';
 import prisma from './db';
 import { logger } from './logger';
 
-// Helper to sleep/wait
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 interface ScrapedMessage {
@@ -32,14 +31,13 @@ interface ScrapeJob {
 
 type PoolEntry = { worker: Worker; busy: boolean; currentJob?: ScrapeJob };
 
-// Helper to strip unwanted strings and normalize text for better matching
 function cleanMessage(text: string): string {
     return text
         .replace(/📷TlkInst/gi, ' ')
         .replace(/🎞Канал со стримами/gi, ' ')
         .replace(/✅ Підпишись на СХІ[ДD]/gi, ' ')
-        .replace(/[’ʼ]/g, "'")    // Normalize apostrophes
-        .replace(/[^\S\r\n]+/g, ' ') // Collapse spaces/tabs but KEEP newlines (\r\n)
+        .replace(/[’ʼ]/g, "'")
+        .replace(/[^\S\r\n]+/g, ' ')
         .trim();
 }
 
@@ -50,26 +48,28 @@ type CachedRule = { phrase: string; exclude: boolean };
 export class Scraper {
     private isRunning = false;
     private intervalSeconds: number;
-    /** Fixed pool of workers. */
     private pool: PoolEntry[] = [];
-    /** Jobs waiting to be dispatched. */
     private jobQueue: ScrapeJob[] = [];
-    /** Channel IDs currently being scraped (dispatched but result not yet received). */
     private inFlight = new Set<number>();
     private channelCache = new Map<number, CachedChannel>();
     private rulesCache: CachedRule[] = [];
     private lastRulesRefreshAt = 0;
+    private failureBackoffUntil = new Map<number, number>();
+    private recentlyEmitted = new Map<number, Map<string, number>>();
     private static readonly RULES_CACHE_TTL_MS = 60_000;
     private static readonly POOL_SIZE = Math.min(8, Math.max(1, 2 * os.cpus().length));
+    private static readonly FAILURE_BACKOFF_MS = 500;
+    private static readonly RECENTLY_EMITTED_TTL_MS = 60_000;
+    private static readonly MIN_SLEEP_MS = 50;
 
-    constructor(intervalSeconds: number = 2) {
+    constructor(intervalSeconds: number = 0.2) {
         this.intervalSeconds = intervalSeconds;
     }
 
     public async start() {
         if (this.isRunning) return;
         this.isRunning = true;
-        logger.info(`Scraper started with pool of ${Scraper.POOL_SIZE} workers, triggering every ${this.intervalSeconds} seconds.`);
+        logger.info(`Scraper started with pool of ${Scraper.POOL_SIZE} workers, poll every ${this.intervalSeconds * 1000}ms.`);
 
         await this.refreshChannelCache();
         await this.refreshRulesCache();
@@ -84,13 +84,34 @@ export class Scraper {
             if (Date.now() - this.lastRulesRefreshAt > Scraper.RULES_CACHE_TTL_MS) {
                 await this.refreshRulesCache();
             }
-            await delay(this.intervalSeconds * 1000);
+            await delay(this.computeSleepMs());
             try {
                 await this.triggerScrapeCycle();
             } catch (error) {
                 logger.error('Error during scrape cycle:', undefined, { error });
             }
         }
+    }
+
+    private computeSleepMs(): number {
+        const now = Date.now();
+        const pollMs = this.intervalSeconds * 1000;
+        let msUntilNextDue = pollMs;
+
+        for (const channel of this.channelCache.values()) {
+            const lastScrape = channel.lastScrapedAt ? new Date(channel.lastScrapedAt).getTime() : 0;
+            const remaining = channel.scrapTimeout - (now - lastScrape);
+            if (remaining <= 0) return Scraper.MIN_SLEEP_MS;
+            msUntilNextDue = Math.min(msUntilNextDue, remaining);
+        }
+
+        return Math.max(Scraper.MIN_SLEEP_MS, Math.min(pollMs, msUntilNextDue));
+    }
+
+    private scheduleNextCycle(): void {
+        this.triggerScrapeCycle().catch(error =>
+            logger.error('Error during scheduled scrape cycle:', undefined, { error })
+        );
     }
 
     private async refreshChannelCache() {
@@ -104,6 +125,30 @@ export class Scraper {
         const rules = await prisma.filterPhrase.findMany();
         this.rulesCache = rules.map(r => ({ phrase: r.phrase, exclude: r.exclude }));
         this.lastRulesRefreshAt = Date.now();
+    }
+
+    private isRecentlyEmitted(channelId: number, telegramId: number): boolean {
+        const channelSet = this.recentlyEmitted.get(channelId);
+        if (!channelSet) return false;
+
+        const key = telegramId.toString();
+        const expiresAt = channelSet.get(key);
+        if (expiresAt == null) return false;
+
+        if (Date.now() > expiresAt) {
+            channelSet.delete(key);
+            return false;
+        }
+        return true;
+    }
+
+    private markRecentlyEmitted(channelId: number, telegramId: number): void {
+        let channelSet = this.recentlyEmitted.get(channelId);
+        if (!channelSet) {
+            channelSet = new Map();
+            this.recentlyEmitted.set(channelId, channelSet);
+        }
+        channelSet.set(telegramId.toString(), Date.now() + Scraper.RECENTLY_EMITTED_TTL_MS);
     }
 
     private getWorkerPath(): string {
@@ -123,19 +168,33 @@ export class Scraper {
         worker.on('message', (result: WorkerResult) => this.handleWorkerResult(entry, result));
         worker.on('error', (err) => {
             logger.error('Worker crash', undefined, { error: err });
+            if (entry.currentJob) {
+                this.inFlight.delete(entry.currentJob.channelId);
+                this.failureBackoffUntil.set(
+                    entry.currentJob.channelId,
+                    Date.now() + Scraper.FAILURE_BACKOFF_MS
+                );
+            }
             entry.busy = false;
-            if (entry.currentJob) this.inFlight.delete(entry.currentJob.channelId);
             entry.currentJob = undefined;
             this.removeFromPool(entry);
             this.replacePoolWorker(entry);
+            this.scheduleNextCycle();
         });
         worker.on('exit', (code) => {
             if (code !== 0) logger.warn(`Worker exited with code ${code}`);
+            if (entry.currentJob) {
+                this.inFlight.delete(entry.currentJob.channelId);
+                this.failureBackoffUntil.set(
+                    entry.currentJob.channelId,
+                    Date.now() + Scraper.FAILURE_BACKOFF_MS
+                );
+            }
             entry.busy = false;
-            if (entry.currentJob) this.inFlight.delete(entry.currentJob.channelId);
             entry.currentJob = undefined;
             this.removeFromPool(entry);
             this.replacePoolWorker(entry);
+            this.scheduleNextCycle();
         });
 
         return entry;
@@ -157,18 +216,34 @@ export class Scraper {
         }
     }
 
+    private async markScrapeSuccess(channelId: number): Promise<void> {
+        await prisma.channel.update({
+            where: { id: channelId },
+            data: { lastScrapedAt: new Date() }
+        });
+        await this.refreshChannelCache();
+    }
+
     private handleWorkerResult(entry: PoolEntry, result: WorkerResult) {
         this.inFlight.delete(result.channelId);
         entry.busy = false;
         entry.currentJob = undefined;
+
         if (result.success && result.messages) {
-            this.processMessages(result.channelId, result.messages).catch((err) =>
+            this.failureBackoffUntil.delete(result.channelId);
+            void this.markScrapeSuccess(result.channelId).catch(err =>
+                logger.error('Failed to update lastScrapedAt', result.channelId, { error: err })
+            );
+            this.processMessages(result.channelId, result.messages).catch(err =>
                 logger.error('processMessages error', result.channelId, { error: err })
             );
         } else if (result.error) {
+            this.failureBackoffUntil.set(result.channelId, Date.now() + Scraper.FAILURE_BACKOFF_MS);
             logger.error(`Worker error for ${result.username}:`, result.channelId, { error: result.error });
         }
+
         this.dispatchNext();
+        this.scheduleNextCycle();
     }
 
     private getIdleWorker(): PoolEntry | undefined {
@@ -187,24 +262,27 @@ export class Scraper {
     }
 
     private async triggerScrapeCycle() {
-        const now = new Date();
+        const now = Date.now();
         const channels = Array.from(this.channelCache.values());
 
-        const toScrape: CachedChannel[] = [];
         for (const channel of channels) {
+            const backoffUntil = this.failureBackoffUntil.get(channel.id) ?? 0;
+            if (now < backoffUntil) continue;
+
             const lastScrape = channel.lastScrapedAt ? new Date(channel.lastScrapedAt).getTime() : 0;
-            const elapsed = now.getTime() - lastScrape;
-            if (elapsed >= channel.scrapTimeout && !this.inFlight.has(channel.id) && !this.jobQueue.some(j => j.channelId === channel.id)) {
-                toScrape.push(channel);
-                this.jobQueue.push({ channelId: channel.id, username: channel.link.split('/').pop() || '' });
+            const elapsed = now - lastScrape;
+            if (
+                elapsed >= channel.scrapTimeout &&
+                !this.inFlight.has(channel.id) &&
+                !this.jobQueue.some(j => j.channelId === channel.id)
+            ) {
+                this.jobQueue.push({
+                    channelId: channel.id,
+                    username: channel.link.split('/').pop() || ''
+                });
             }
         }
-        if (toScrape.length > 0) {
-            await prisma.$transaction(
-                toScrape.map(ch => prisma.channel.update({ where: { id: ch.id }, data: { lastScrapedAt: now } }))
-            );
-            await this.refreshChannelCache();
-        }
+
         while (this.jobQueue.length > 0 && this.getIdleWorker()) {
             this.dispatchNext();
         }
@@ -229,7 +307,6 @@ export class Scraper {
         const excludeRules = rules.filter(r => r.exclude).map(r => normalize(r.phrase));
         const includeRules = rules.filter(r => !r.exclude).map(r => normalize(r.phrase));
 
-        // 3. BATCH DUPLICATE CHECK (Fetch all relevant IDs once)
         const msgIds = messages.map(m => BigInt(m.telegramId));
         const existingMessages = await prisma.message.findMany({
             where: { channelId, telegramId: { in: msgIds } },
@@ -242,9 +319,9 @@ export class Scraper {
         type Prepared = { outMessage: string; mediaUrl?: string; mediaType?: 'photo' | 'video'; telegramId: number };
         const prepared: Prepared[] = [];
 
-        // 4. PREPARE: save all new messages (with sent flag); build payloads for alerts only
         for (const msg of messages) {
-            if (existingIdsSet.has(msg.telegramId.toString())) continue;
+            const idStr = msg.telegramId.toString();
+            if (existingIdsSet.has(idStr) || this.isRecentlyEmitted(channelId, msg.telegramId)) continue;
 
             const cleanedText = cleanMessage(msg.text);
             const normalizedText = normalize(cleanedText);
@@ -273,27 +350,10 @@ export class Scraper {
             prepared.push({ outMessage, mediaUrl: msg.mediaUrl, mediaType: msg.mediaType, telegramId: msg.telegramId });
         }
 
-        // 5. PERSIST first (scraper is independent of Telegram)
-        if (allMessagesToPersist.length > 0) {
-            try {
-                await prisma.message.createMany({
-                    data: allMessagesToPersist.map(m => ({
-                        telegramId: m.telegramId,
-                        message: m.message,
-                        mediaUrl: m.mediaUrl,
-                        mediaType: m.mediaType,
-                        date: m.date,
-                        sent: m.sent,
-                        channelId: m.channelId
-                    }))
-                });
-            } catch (e) {
-                // Fail silently for DB errors on logging
-            }
-        }
-
-        // 6. EMIT alerts for sender to deliver (non-blocking; scraper does not wait)
         if (prepared.length > 0 && subscribers.length > 0) {
+            for (const p of prepared) {
+                this.markRecentlyEmitted(channelId, p.telegramId);
+            }
             emitAlerts({
                 channelId,
                 channelName,
@@ -301,6 +361,20 @@ export class Scraper {
                 subscriberIds: subscribers.map(s => s.telegramId)
             });
             prepared.forEach(p => logger.info(`🚨 Alert queued for ${p.telegramId}`, channelId));
+        }
+
+        if (allMessagesToPersist.length > 0) {
+            void prisma.message.createMany({
+                data: allMessagesToPersist.map(m => ({
+                    telegramId: m.telegramId,
+                    message: m.message,
+                    mediaUrl: m.mediaUrl,
+                    mediaType: m.mediaType,
+                    date: m.date,
+                    sent: m.sent,
+                    channelId: m.channelId
+                }))
+            }).catch(e => logger.error('Failed to persist messages', channelId, { error: e }));
         }
     }
 }
