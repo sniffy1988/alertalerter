@@ -51,10 +51,14 @@ async function main() {
 
     const sessionPath = process.env.TELEGRAM_SESSION_PATH?.trim();
     if (sessionPath) {
-        persistSession(saved);
-        console.log(`\nSession also written to ${sessionPath}`);
+        if (persistSession(saved)) {
+            console.log(`\nSession also written to ${sessionPath}`);
+        } else {
+            console.log(`\nCould not write to ${sessionPath} (path may be Docker-only).`);
+            console.log('Copy TELEGRAM_USER_SESSION above into .env or Portainer env instead.');
+        }
     } else {
-        console.log('\nOr set TELEGRAM_SESSION_PATH=/database/telegram.session to save on volume');
+        console.log('\nOptional: TELEGRAM_SESSION_PATH=./db_data/telegram.session (local) or /database/telegram.session (Docker)');
     }
 
     await client.disconnect();

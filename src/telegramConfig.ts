@@ -1,4 +1,5 @@
 import fs from 'fs';
+import path from 'path';
 
 export function loadSessionString(): string {
     const fromEnv = process.env.TELEGRAM_USER_SESSION?.trim();
@@ -35,9 +36,15 @@ export function getApiCredentials(): { apiId: number; apiHash: string } {
     return { apiId, apiHash };
 }
 
-export function persistSession(clientSession: string): void {
+export function persistSession(clientSession: string): boolean {
     const sessionPath = process.env.TELEGRAM_SESSION_PATH?.trim();
-    if (sessionPath) {
+    if (!sessionPath) return false;
+
+    try {
+        fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
         fs.writeFileSync(sessionPath, clientSession, 'utf8');
+        return true;
+    } catch {
+        return false;
     }
 }
