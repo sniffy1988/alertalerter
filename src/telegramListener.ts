@@ -19,7 +19,7 @@ export class TelegramListener {
     private healthy = false;
     private reconnectTimer: ReturnType<typeof setInterval> | null = null;
     private readonly peerToChannel = new Map<string, ChannelMapping>();
-    private channelEntities: Api.TypeEntityLike[] = [];
+    private watchedPeerIds: string[] = [];
     private handlerRegistered = false;
     private readonly groupedSeen = new Set<string>();
     private readonly boundHandler: (event: NewMessageEvent) => Promise<void>;
@@ -91,7 +91,7 @@ export class TelegramListener {
         if (!this.client) return;
 
         this.peerToChannel.clear();
-        this.channelEntities = [];
+        this.watchedPeerIds = [];
 
         const channels = await prisma.channel.findMany({
             select: { id: true, link: true }
@@ -105,7 +105,7 @@ export class TelegramListener {
 
                 const peerId = utils.getPeerId(entity).toString();
                 this.peerToChannel.set(peerId, { channelId: ch.id, username });
-                this.channelEntities.push(entity);
+                this.watchedPeerIds.push(peerId);
 
                 logger.info(`MTProto watching @${username}`, ch.id);
             } catch (err) {
@@ -135,45 +135,45 @@ export class TelegramListener {
 
         this.client.addEventHandler(
             this.boundHandler,
-            new NewMessage({ chats: this.channelEntities })
+            new NewMessage({ chats: this.watchedPeerIds })
         );
         this.handlerRegistered = true;
     }
 
     private async handleNewMessage(event: NewMessageEvent): Promise<void> {
-        if (!event.isChannel) return;
-
-        const chatId = event.chatId?.toString();
-        if (!chatId) return;
-
-        const mapping = this.peerToChannel.get(chatId);
-        if (!mapping) return;
-
-        const msg = event.message;
-        if (msg.editDate) return;
-
-        if (msg.groupedId) {
-            const groupedKey = `${chatId}:${msg.groupedId.toString()}`;
-            if (this.groupedSeen.has(groupedKey)) return;
-            this.groupedSeen.add(groupedKey);
-            if (this.groupedSeen.size > 1000) {
-                this.groupedSeen.clear();
-            }
-        }
-
-        const text = msg.message || '';
-        if (!text && !msg.media) return;
-
-        const incoming: IncomingMessage = {
-            telegramId: msg.id,
-            text,
-            date: new Date(msg.date * 1000)
-        };
-
         try {
+            if (!event.isChannel) return;
+
+            const chatId = event.chatId?.toString();
+            if (!chatId) return;
+
+            const mapping = this.peerToChannel.get(chatId);
+            if (!mapping) return;
+
+            const msg = event.message;
+            if (msg.editDate) return;
+
+            if (msg.groupedId) {
+                const groupedKey = `${chatId}:${msg.groupedId.toString()}`;
+                if (this.groupedSeen.has(groupedKey)) return;
+                this.groupedSeen.add(groupedKey);
+                if (this.groupedSeen.size > 1000) {
+                    this.groupedSeen.clear();
+                }
+            }
+
+            const text = msg.message || '';
+            if (!text && !msg.media) return;
+
+            const incoming: IncomingMessage = {
+                telegramId: msg.id,
+                text,
+                date: new Date(msg.date * 1000)
+            };
+
             await this.processor.processIncomingMessages(mapping.channelId, [incoming], 'mtproto');
         } catch (err) {
-            logger.error('MTProto message processing error', mapping.channelId, { error: err });
+            logger.error('MTProto message handler error', undefined, { error: err });
         }
     }
 }
