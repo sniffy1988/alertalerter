@@ -19,7 +19,6 @@ export class TelegramListener {
     private healthy = false;
     private reconnectTimer: ReturnType<typeof setInterval> | null = null;
     private readonly peerToChannel = new Map<string, ChannelMapping>();
-    private watchedPeerIds: string[] = [];
     private handlerRegistered = false;
     private readonly groupedSeen = new Set<string>();
     private readonly boundHandler: (event: NewMessageEvent) => Promise<void>;
@@ -91,7 +90,6 @@ export class TelegramListener {
         if (!this.client) return;
 
         this.peerToChannel.clear();
-        this.watchedPeerIds = [];
 
         const channels = await prisma.channel.findMany({
             select: { id: true, link: true }
@@ -104,8 +102,12 @@ export class TelegramListener {
                 await this.tryJoinChannel(entity);
 
                 const peerId = utils.getPeerId(entity).toString();
-                this.peerToChannel.set(peerId, { channelId: ch.id, username });
-                this.watchedPeerIds.push(peerId);
+                const mapping: ChannelMapping = { channelId: ch.id, username };
+                this.peerToChannel.set(peerId, mapping);
+                if (entity instanceof Api.Channel) {
+                    this.peerToChannel.set(`-100${entity.id}`, mapping);
+                    this.peerToChannel.set(entity.id.toString(), mapping);
+                }
 
                 logger.info(`MTProto watching @${username}`, ch.id);
             } catch (err) {
@@ -135,7 +137,7 @@ export class TelegramListener {
 
         this.client.addEventHandler(
             this.boundHandler,
-            new NewMessage({ chats: this.watchedPeerIds })
+            new NewMessage({})
         );
         this.handlerRegistered = true;
     }
@@ -147,8 +149,16 @@ export class TelegramListener {
             const chatId = event.chatId?.toString();
             if (!chatId) return;
 
-            const mapping = this.peerToChannel.get(chatId);
-            if (!mapping) return;
+            const mapping = chatId ? this.peerToChannel.get(chatId) : undefined;
+            if (!mapping) {
+                if (event.isChannel) {
+                    logger.warn('MTProto message from unmapped channel', undefined, {
+                        chatId,
+                        knownPeerIds: [...this.peerToChannel.keys()]
+                    });
+                }
+                return;
+            }
 
             const msg = event.message;
             if (msg.editDate) return;
@@ -162,8 +172,11 @@ export class TelegramListener {
                 }
             }
 
-            const text = msg.message || '';
-            if (!text && !msg.media) return;
+            let text = msg.message || '';
+            if (!text && msg.media) {
+                text = '(media)';
+            }
+            if (!text) return;
 
             const incoming: IncomingMessage = {
                 telegramId: msg.id,

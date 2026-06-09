@@ -193,17 +193,35 @@ export class MessageProcessor {
         }
 
         if (allMessagesToPersist.length > 0) {
-            void prisma.message.createMany({
-                data: allMessagesToPersist.map(m => ({
-                    telegramId: m.telegramId,
-                    message: m.message,
-                    mediaUrl: m.mediaUrl,
-                    mediaType: m.mediaType,
-                    date: m.date,
-                    sent: m.sent,
-                    channelId: m.channelId
-                }))
-            }).catch(e => logger.error(`Failed to persist messages (${source})`, channelId, { error: e }));
+            try {
+                const results = await Promise.all(
+                    allMessagesToPersist.map(m =>
+                        prisma.message.upsert({
+                            where: {
+                                telegramId_channelId: {
+                                    telegramId: m.telegramId,
+                                    channelId: m.channelId
+                                }
+                            },
+                            create: {
+                                telegramId: m.telegramId,
+                                message: m.message,
+                                mediaUrl: m.mediaUrl,
+                                mediaType: m.mediaType,
+                                date: m.date,
+                                sent: m.sent,
+                                channelId: m.channelId
+                            },
+                            update: {}
+                        })
+                    )
+                );
+                logger.info(`Persisted ${results.length} message(s) (${source})`, channelId, {
+                    attempted: allMessagesToPersist.length
+                });
+            } catch (e) {
+                logger.error(`Failed to persist messages (${source})`, channelId, { error: e });
+            }
         }
     }
 }
