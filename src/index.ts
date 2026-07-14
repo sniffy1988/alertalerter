@@ -6,6 +6,7 @@ import { registerAlertSender } from './alertSender';
 import { MessageProcessor } from './messageProcessor';
 import { TelegramListener } from './telegramListener';
 import { getIngestMode } from './telegramConfig';
+import { probeTelegramWebScrape } from './telegramWebScrape';
 import { logger } from './logger';
 
 async function main() {
@@ -37,11 +38,28 @@ async function main() {
         try {
             await listener.start();
         } catch (err) {
-            logger.error('MTProto listener failed to start — using t.me fallback only', undefined, { error: err });
+            logger.error('MTProto listener failed to start — using web scrape fallback only', undefined, { error: err });
             listener = null;
         }
     } else {
-        logger.info('Ingest mode: t.me scrape only (set TELEGRAM_API_ID/HASH/SESSION for MTProto)');
+        logger.info('Ingest mode: web scrape only (t.me / telegram.me; set TELEGRAM_API_ID/HASH/SESSION for MTProto)');
+    }
+
+    const webProbe = await probeTelegramWebScrape();
+    if (webProbe.workingHost) {
+        const failed = webProbe.attempts.filter(a => !a.ok);
+        if (failed.length > 0) {
+            logger.warn('Web scrape probe: using fallback host', undefined, {
+                host: webProbe.workingHost,
+                failed: failed.map(a => ({ host: a.host, error: a.error }))
+            });
+        } else {
+            logger.info('Web scrape probe OK', undefined, { host: webProbe.workingHost });
+        }
+    } else {
+        logger.error('Web scrape probe failed for all hosts', undefined, {
+            attempts: webProbe.attempts.map(a => ({ host: a.host, error: a.error }))
+        });
     }
 
     const scraper = new Scraper(0.2, processor);
