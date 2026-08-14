@@ -18,6 +18,7 @@ type ChannelMapping = { channelId: number; username: string; peerId: string };
 
 const KEEP_ALIVE_MS = 30_000;
 const RECONNECT_MS = 30_000;
+const RAW_UPDATE_LOG_LIMIT = 40;
 
 export class TelegramListener {
     private client: TelegramClient | null = null;
@@ -33,6 +34,7 @@ export class TelegramListener {
     private readonly groupedSeen = new Set<string>();
     private readonly boundHandler: (event: NewMessageEvent) => Promise<void>;
     private lastMessageAt = 0;
+    private rawUpdateLogs = 0;
 
     constructor(private readonly processor: MessageProcessor) {
         this.boundHandler = (event) => this.handleNewMessage(event);
@@ -96,7 +98,7 @@ export class TelegramListener {
             this.markUnhealthy('socket not connected');
             return;
         }
-        await this.client.getMe();
+        await this.client.invoke(new Api.updates.GetState());
     }
 
     private async connect(): Promise<void> {
@@ -119,6 +121,7 @@ export class TelegramListener {
             }
 
             this.handlerRegistered = false;
+            this.rawUpdateLogs = 0;
             this.client = new TelegramClient(session, apiId, apiHash, {
                 connectionRetries: 5
             });
@@ -136,7 +139,7 @@ export class TelegramListener {
 
             await this.setupChannels();
             this.registerHandler();
-            await this.tryCatchUp();
+            await this.client.invoke(new Api.updates.GetState());
 
             const saved = session.save();
             if (saved && saved !== sessionStr) {
@@ -151,16 +154,6 @@ export class TelegramListener {
         }
     }
 
-    private async tryCatchUp(): Promise<void> {
-        const client = this.client as (TelegramClient & { catchUp?: () => void | Promise<void> }) | null;
-        if (!client || typeof client.catchUp !== 'function') return;
-        try {
-            await Promise.resolve(client.catchUp());
-        } catch (err) {
-            logger.warn('MTProto catchUp failed', undefined, { error: err });
-        }
-    }
-
     private registerChannelPeer(mapping: ChannelMapping): void {
         for (const alias of peerIdAliases(mapping.peerId)) {
             this.peerToChannel.set(alias, mapping);
@@ -168,6 +161,11 @@ export class TelegramListener {
         if (!this.watchedPeerIds.includes(mapping.peerId)) {
             this.watchedPeerIds.push(mapping.peerId);
         }
+    }
+
+    private mappingFromPeerId(peerId: string | undefined): ChannelMapping | undefined {
+        if (!peerId) return undefined;
+        return this.peerToChannel.get(peerId);
     }
 
     private async setupChannels(): Promise<void> {
@@ -200,6 +198,7 @@ export class TelegramListener {
                 this.channelMappings.set(ch.id, mapping);
                 this.registerChannelPeer(mapping);
                 this.watchedChannelCount++;
+                await this.subscribeChannelPts(entity, ch.id, username);
 
                 logger.info(`MTProto watching @${username}`, ch.id, { telegramPeerId: peerId });
             } catch (err) {
@@ -209,6 +208,35 @@ export class TelegramListener {
 
         if (this.watchedChannelCount === 0) {
             throw new Error('No channels could be registered for MTProto ingest');
+        }
+    }
+
+    private async subscribeChannelPts(
+        entity: Api.TypeEntityLike,
+        channelId: number,
+        username: string
+    ): Promise<void> {
+        if (!this.client) return;
+        try {
+            const full = await this.client.invoke(new Api.channels.GetFullChannel({ channel: entity }));
+            const pts = 'pts' in full.fullChat ? Number(full.fullChat.pts) : 1;
+            const diff = await this.client.invoke(new Api.updates.GetChannelDifference({
+                channel: entity,
+                filter: new Api.ChannelMessagesFilterEmpty(),
+                pts,
+                limit: 100,
+                force: true
+            }));
+            logger.info('MTProto channel pts subscribed', channelId, {
+                username: `@${username}`,
+                pts,
+                difference: diff.className
+            });
+        } catch (err) {
+            logger.warn('MTProto GetChannelDifference failed', channelId, {
+                username: `@${username}`,
+                error: err
+            });
         }
     }
 
@@ -229,7 +257,13 @@ export class TelegramListener {
 
         this.client.addEventHandler(this.boundHandler, new NewMessage({}));
         this.client.addEventHandler((update: unknown) => {
-            if (!(update instanceof UpdateConnectionState)) return;
+            void this.onRawUpdate(update);
+        }, new Raw({}));
+        this.handlerRegistered = true;
+    }
+
+    private async onRawUpdate(update: unknown): Promise<void> {
+        if (update instanceof UpdateConnectionState) {
             if (update.state === UpdateConnectionState.connected) {
                 if (!this.healthy && this.client?.connected) {
                     this.healthy = true;
@@ -239,8 +273,48 @@ export class TelegramListener {
                 return;
             }
             this.markUnhealthy(`connection state ${update.state}`);
-        }, new Raw({ types: [UpdateConnectionState] }));
-        this.handlerRegistered = true;
+            return;
+        }
+
+        const className =
+            update && typeof update === 'object' && 'className' in update
+                ? String((update as { className?: string }).className)
+                : update?.constructor?.name;
+
+        if (this.rawUpdateLogs < RAW_UPDATE_LOG_LIMIT) {
+            this.rawUpdateLogs++;
+            logger.info('MTProto raw update', undefined, { className, n: this.rawUpdateLogs });
+        }
+
+        if (className === 'UpdatesTooLong') {
+            await this.fetchAccountDifference();
+            return;
+        }
+
+        if (
+            update instanceof Api.UpdateNewChannelMessage ||
+            update instanceof Api.UpdateNewMessage
+        ) {
+            const message = update.message;
+            if (message instanceof Api.Message) {
+                await this.ingestApiMessage(message);
+            }
+        }
+    }
+
+    private async fetchAccountDifference(): Promise<void> {
+        if (!this.client) return;
+        try {
+            const state = await this.client.invoke(new Api.updates.GetState());
+            await this.client.invoke(new Api.updates.GetDifference({
+                pts: state.pts,
+                date: state.date,
+                qts: state.qts
+            }));
+            logger.info('MTProto fetched account difference', undefined, { pts: state.pts });
+        } catch (err) {
+            logger.warn('MTProto GetDifference failed', undefined, { error: err });
+        }
     }
 
     private resolveMapping(event: NewMessageEvent): ChannelMapping | undefined {
@@ -253,31 +327,31 @@ export class TelegramListener {
         const peerId = event.message.peerId
             ? utils.getPeerId(event.message.peerId).toString()
             : undefined;
-        if (peerId) {
-            const byPeer = this.peerToChannel.get(peerId);
-            if (byPeer) return byPeer;
-        }
-
-        return undefined;
+        return this.mappingFromPeerId(peerId);
     }
 
     private async handleNewMessage(event: NewMessageEvent): Promise<void> {
         try {
             if (!event.isChannel) return;
+            await this.ingestApiMessage(event.message);
+        } catch (err) {
+            logger.error('MTProto message handler error', undefined, { error: err });
+        }
+    }
 
-            const mapping = this.resolveMapping(event);
+    private async ingestApiMessage(msg: Api.Message): Promise<void> {
+        try {
+            if (!msg.peerId) return;
+            const peerId = utils.getPeerId(msg.peerId).toString();
+            const mapping = this.mappingFromPeerId(peerId);
             if (!mapping) {
                 logger.warn('MTProto message from unmapped channel', undefined, {
-                    chatId: event.chatId?.toString(),
-                    peerId: event.message.peerId
-                        ? utils.getPeerId(event.message.peerId).toString()
-                        : undefined,
+                    peerId,
                     knownPeerIds: this.watchedPeerIds
                 });
                 return;
             }
 
-            const msg = event.message;
             if (msg.editDate) return;
 
             if (msg.groupedId) {
@@ -311,7 +385,7 @@ export class TelegramListener {
 
             await this.processor.processIncomingMessages(mapping.channelId, [incoming], 'mtproto');
         } catch (err) {
-            logger.error('MTProto message handler error', undefined, { error: err });
+            logger.error('MTProto ingest error', undefined, { error: err });
         }
     }
 }
