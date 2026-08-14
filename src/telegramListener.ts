@@ -33,6 +33,9 @@ export class TelegramListener {
     private readonly groupedSeen = new Set<string>();
     private readonly boundHandler: (event: NewMessageEvent) => Promise<void>;
     private lastMessageAt = 0;
+    private readonly channelPts = new Map<number, number>();
+    private readonly channelEntities = new Map<number, Api.TypeEntityLike>();
+    private ptsPollGeneration = 0;
 
     constructor(private readonly processor: MessageProcessor) {
         this.boundHandler = (event) => this.handleNewMessage(event);
@@ -69,6 +72,7 @@ export class TelegramListener {
     private markUnhealthy(reason: string): void {
         if (!this.healthy) return;
         this.healthy = false;
+        this.ptsPollGeneration++;
         this.stopKeepAlive();
         logger.warn('MTProto marked unhealthy', undefined, { reason });
     }
@@ -103,6 +107,7 @@ export class TelegramListener {
         if (this.connecting) return;
         this.connecting = true;
         this.healthy = false;
+        this.ptsPollGeneration++;
         this.stopKeepAlive();
 
         try {
@@ -145,6 +150,7 @@ export class TelegramListener {
 
             this.healthy = true;
             this.startKeepAlive();
+            this.startChannelPtsPoll();
             logger.info(`MTProto listener connected, watching ${this.watchedChannelCount} channel(s)`);
         } finally {
             this.connecting = false;
@@ -170,6 +176,8 @@ export class TelegramListener {
 
         this.peerToChannel.clear();
         this.channelMappings.clear();
+        this.channelPts.clear();
+        this.channelEntities.clear();
         this.watchedPeerIds = [];
         this.watchedChannelCount = 0;
 
@@ -224,9 +232,15 @@ export class TelegramListener {
                 limit: 100,
                 force: true
             }));
+            this.channelEntities.set(channelId, entity);
+            this.channelPts.set(
+                channelId,
+                'pts' in diff ? Number(diff.pts) : pts
+            );
+            await this.applyChannelDifference(channelId, username, diff);
             logger.info('MTProto channel pts subscribed', channelId, {
                 username: `@${username}`,
-                pts,
+                pts: this.channelPts.get(channelId),
                 difference: diff.className
             });
         } catch (err) {
@@ -234,6 +248,84 @@ export class TelegramListener {
                 username: `@${username}`,
                 error: err
             });
+        }
+    }
+
+    private startChannelPtsPoll(): void {
+        const generation = ++this.ptsPollGeneration;
+        logger.info('MTProto channel difference poll started');
+        void this.runChannelPtsPoll(generation);
+    }
+
+    private async runChannelPtsPoll(generation: number): Promise<void> {
+        while (this.healthy && this.client && generation === this.ptsPollGeneration) {
+            for (const mapping of this.channelMappings.values()) {
+                if (!this.healthy || generation !== this.ptsPollGeneration) return;
+                await this.pollChannelDifference(mapping);
+            }
+            await new Promise(r => setTimeout(r, 1000));
+        }
+    }
+
+    private async pollChannelDifference(mapping: ChannelMapping): Promise<void> {
+        if (!this.client) return;
+        const entity = this.channelEntities.get(mapping.channelId);
+        const pts = this.channelPts.get(mapping.channelId);
+        if (!entity || pts == null) return;
+        try {
+            const diff = await this.client.invoke(new Api.updates.GetChannelDifference({
+                channel: entity,
+                filter: new Api.ChannelMessagesFilterEmpty(),
+                pts,
+                limit: 100
+            }));
+            await this.applyChannelDifference(mapping.channelId, mapping.username, diff);
+        } catch (err) {
+            logger.warn('MTProto channel poll failed', mapping.channelId, {
+                username: `@${mapping.username}`,
+                error: err
+            });
+        }
+    }
+
+    private async applyChannelDifference(
+        channelId: number,
+        username: string,
+        diff: Api.updates.TypeChannelDifference
+    ): Promise<void> {
+        if (diff.className === 'updates.ChannelDifferenceEmpty') {
+            if ('pts' in diff) this.channelPts.set(channelId, Number(diff.pts));
+            return;
+        }
+
+        if (diff.className === 'updates.ChannelDifference') {
+            const d = diff as Api.updates.ChannelDifference;
+            this.channelPts.set(channelId, Number(d.pts));
+            const messages = d.newMessages ?? [];
+            logger.info('MTProto channel difference', channelId, {
+                username: `@${username}`,
+                newMessages: messages.length,
+                pts: d.pts
+            });
+            for (const m of messages) {
+                if (m instanceof Api.Message) await this.ingestApiMessage(m);
+            }
+            return;
+        }
+
+        if (diff.className === 'updates.ChannelDifferenceTooLong') {
+            const d = diff as Api.updates.ChannelDifferenceTooLong;
+            const messages = d.messages ?? [];
+            logger.info('MTProto channel difference too long', channelId, {
+                username: `@${username}`,
+                messages: messages.length
+            });
+            for (const m of messages) {
+                if (m instanceof Api.Message) await this.ingestApiMessage(m);
+            }
+            if (d.dialog && 'pts' in d.dialog) {
+                this.channelPts.set(channelId, Number((d.dialog as { pts?: number }).pts));
+            }
         }
     }
 
@@ -307,15 +399,17 @@ export class TelegramListener {
 
     private async onRawUpdate(update: unknown): Promise<void> {
         if (update instanceof UpdateConnectionState) {
-            logger.info('MTProto connection update', undefined, { state: update.state });
             if (update.state === UpdateConnectionState.connected) {
+                logger.debug('MTProto connection update', undefined, { state: update.state });
                 if (!this.healthy && this.client?.connected) {
                     this.healthy = true;
                     this.startKeepAlive();
+                    this.startChannelPtsPoll();
                     logger.info('MTProto connection restored');
                 }
                 return;
             }
+            logger.info('MTProto connection update', undefined, { state: update.state });
             this.markUnhealthy(`connection state ${update.state}`);
             return;
         }
