@@ -3,14 +3,14 @@ import { Worker } from 'worker_threads';
 import prisma from './db';
 import { logger } from './logger';
 import { MessageProcessor, type IncomingMessage } from './messageProcessor';
-import { probeTelegramWebScrape } from './telegramWebScrape';
+import { getPreferredHost, probeTelegramWebScrape } from './telegramWebScrape';
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function parsePoolSize(): number {
     const n = Number(process.env.SCRAPER_POOL_SIZE);
-    if (Number.isFinite(n) && n >= 1) return Math.min(8, Math.floor(n));
-    return 2;
+    if (Number.isFinite(n) && n >= 1) return Math.min(16, Math.floor(n));
+    return 4;
 }
 
 interface WorkerResult {
@@ -18,6 +18,7 @@ interface WorkerResult {
     channelId: number;
     username: string;
     messages?: IncomingMessage[];
+    maxTelegramId?: number;
     error?: any;
     log?: string;
 }
@@ -25,16 +26,28 @@ interface WorkerResult {
 interface ScrapeJob {
     channelId: number;
     username: string;
+    afterTelegramId?: number;
 }
+
+export type AddedChannel = {
+    id: number;
+    link: string;
+    scrapTimeout: number;
+    name: string | null;
+};
 
 type PoolEntry = { worker: Worker; busy: boolean; currentJob?: ScrapeJob };
 
-type CachedChannel = { id: number; link: string; lastScrapedAt: Date | null; scrapTimeout: number; name: string | null };
-
-export type ScraperOptions = {
-    /** When false, scraper idles (MTProto-only mode). Default: always run. */
-    enabled?: () => boolean;
+type CachedChannel = AddedChannel & {
+    lastScrapedAt: Date | null;
+    lastSeenTelegramId?: number;
 };
+
+let activeScraper: Scraper | null = null;
+
+export function notifyScraperChannelAdded(channel: AddedChannel): void {
+    activeScraper?.addChannel(channel);
+}
 
 /** Worker pool with job queue; each channel has its own scrapTimeout (ms) from DB. */
 export class Scraper {
@@ -45,52 +58,72 @@ export class Scraper {
     private inFlight = new Set<number>();
     private channelCache = new Map<number, CachedChannel>();
     private failureBackoffUntil = new Map<number, number>();
-    private enabled: () => boolean;
-    private shuttingDownPool = false;
-    private poolWanted = false;
+    private failureStreak = new Map<number, number>();
     private probed = false;
+    private lastCacheRefreshAt = 0;
+    private lastScrapeAt = 0;
     private readonly poolSize: number;
-    private static readonly FAILURE_BACKOFF_MS = 500;
     private static readonly MIN_SLEEP_MS = 50;
-    private static readonly IDLE_SLEEP_MS = 5_000;
+    private static readonly CACHE_REFRESH_MS = 15_000;
+    private static readonly FAILURE_BACKOFF_START_MS = 1_000;
+    private static readonly FAILURE_BACKOFF_CAP_MS = 30_000;
 
     constructor(
         intervalSeconds: number = 0.2,
-        private readonly processor: MessageProcessor,
-        options: ScraperOptions = {}
+        private readonly processor: MessageProcessor
     ) {
         this.intervalSeconds = intervalSeconds;
-        this.enabled = options.enabled ?? (() => true);
         this.poolSize = parsePoolSize();
+        activeScraper = this;
     }
 
     isPoolActive(): boolean {
         return this.pool.length > 0;
     }
 
+    getHealth() {
+        return {
+            channelCount: this.channelCache.size,
+            scrapeActive: this.isPoolActive(),
+            poolSize: this.poolSize,
+            lastScrapeAt: this.lastScrapeAt > 0 ? new Date(this.lastScrapeAt).toISOString() : null
+        };
+    }
+
+    addChannel(channel: AddedChannel): void {
+        const prev = this.channelCache.get(channel.id);
+        this.channelCache.set(channel.id, {
+            ...channel,
+            lastScrapedAt: prev?.lastScrapedAt ?? null,
+            lastSeenTelegramId: prev?.lastSeenTelegramId
+        });
+    }
+
     public async start() {
         if (this.isRunning) return;
         this.isRunning = true;
         logger.info(
-            `Scraper ready (pool ${this.poolSize}, poll ${this.intervalSeconds * 1000}ms, fallback when MTProto idle)`
+            `Scraper ready (pool ${this.poolSize}, poll ${this.intervalSeconds * 1000}ms)`
         );
 
         await this.refreshChannelCache();
 
         while (this.isRunning) {
-            if (this.enabled()) {
-                await this.ensureWebProbe();
-                this.ensurePool();
+            await this.ensureWebProbe();
+            this.ensurePool();
+            if (Date.now() - this.lastCacheRefreshAt >= Scraper.CACHE_REFRESH_MS) {
                 try {
-                    await this.triggerScrapeCycle();
+                    await this.refreshChannelCache();
                 } catch (error) {
-                    logger.error('Error during scrape cycle:', undefined, { error });
+                    logger.error('Failed to refresh channel cache:', undefined, { error });
                 }
-                await delay(this.computeSleepMs());
-            } else {
-                await this.destroyPool();
-                await delay(Scraper.IDLE_SLEEP_MS);
             }
+            try {
+                await this.triggerScrapeCycle();
+            } catch (error) {
+                logger.error('Error during scrape cycle:', undefined, { error });
+            }
+            await delay(this.computeSleepMs());
         }
     }
 
@@ -116,27 +149,10 @@ export class Scraper {
     }
 
     private ensurePool(): void {
-        if (this.pool.length > 0 || this.shuttingDownPool) return;
-        this.poolWanted = true;
+        if (this.pool.length > 0) return;
         logger.info(`Scraper workers starting (${this.poolSize})`);
-        void this.refreshChannelCache();
         for (let i = 0; i < this.poolSize; i++) {
             this.pool.push(this.createPoolWorker());
-        }
-    }
-
-    private async destroyPool(): Promise<void> {
-        if (this.pool.length === 0 && !this.poolWanted) return;
-        this.poolWanted = false;
-        this.shuttingDownPool = true;
-        const entries = [...this.pool];
-        this.pool = [];
-        this.jobQueue = [];
-        this.inFlight.clear();
-        await Promise.all(entries.map(e => e.worker.terminate().catch(() => 0)));
-        this.shuttingDownPool = false;
-        if (entries.length > 0) {
-            logger.info('Scraper workers stopped (MTProto healthy)');
         }
     }
 
@@ -156,24 +172,33 @@ export class Scraper {
     }
 
     private scheduleNextCycle(): void {
-        if (!this.enabled()) return;
+        if (!this.isRunning) return;
         void this.triggerScrapeCycle().catch(error =>
             logger.error('Error during scheduled scrape cycle:', undefined, { error })
         );
     }
 
-    private markScrapeSuccess(channelId: number): void {
-        const now = new Date();
+    private markScrapeSuccess(channelId: number, maxTelegramId?: number): void {
+        const now = Date.now();
+        this.lastScrapeAt = now;
         const cached = this.channelCache.get(channelId);
-        if (cached) {
-            cached.lastScrapedAt = now;
+        if (!cached) return;
+        cached.lastScrapedAt = new Date(now);
+        if (maxTelegramId != null) {
+            cached.lastSeenTelegramId = Math.max(cached.lastSeenTelegramId ?? 0, maxTelegramId);
         }
-        void prisma.channel.update({
-            where: { id: channelId },
-            data: { lastScrapedAt: now }
-        }).catch(err =>
-            logger.error('Failed to update lastScrapedAt', channelId, { error: err })
+        this.failureStreak.delete(channelId);
+        this.failureBackoffUntil.delete(channelId);
+    }
+
+    private markScrapeFailure(channelId: number): void {
+        const streak = (this.failureStreak.get(channelId) ?? 0) + 1;
+        this.failureStreak.set(channelId, streak);
+        const backoffMs = Math.min(
+            Scraper.FAILURE_BACKOFF_CAP_MS,
+            Scraper.FAILURE_BACKOFF_START_MS * 2 ** (streak - 1)
         );
+        this.failureBackoffUntil.set(channelId, Date.now() + backoffMs);
     }
 
     private handleWorkerResult(entry: PoolEntry, result: WorkerResult) {
@@ -182,10 +207,9 @@ export class Scraper {
         entry.currentJob = undefined;
 
         if (result.success && result.messages) {
-            this.failureBackoffUntil.delete(result.channelId);
-            this.markScrapeSuccess(result.channelId);
+            this.markScrapeSuccess(result.channelId, result.maxTelegramId);
 
-            void this.processor.processIncomingMessages(result.channelId, result.messages, 'scrape')
+            void this.processor.processIncomingMessages(result.channelId, result.messages)
                 .then(({ persisted }) => {
                     if (persisted > 0) {
                         logger.info(`Scrape ingested ${persisted} new message(s)`, result.channelId, {
@@ -203,7 +227,7 @@ export class Scraper {
                     logger.error('processMessages error', result.channelId, { error: err })
                 );
         } else if (result.error) {
-            this.failureBackoffUntil.set(result.channelId, Date.now() + Scraper.FAILURE_BACKOFF_MS);
+            this.markScrapeFailure(result.channelId);
             logger.error(`Worker error for ${result.username}:`, result.channelId, { error: result.error });
         }
 
@@ -212,9 +236,38 @@ export class Scraper {
 
     private async refreshChannelCache() {
         const channels = await prisma.channel.findMany({
-            select: { id: true, link: true, lastScrapedAt: true, scrapTimeout: true, name: true }
+            select: { id: true, link: true, scrapTimeout: true, name: true }
         });
-        this.channelCache = new Map(channels.map(c => [c.id, c]));
+
+        const missingSeenIds = channels
+            .filter(c => this.channelCache.get(c.id)?.lastSeenTelegramId == null)
+            .map(c => c.id);
+
+        const maxByChannel = new Map<number, number>();
+        if (missingSeenIds.length > 0) {
+            const rows = await prisma.message.groupBy({
+                by: ['channelId'],
+                where: { channelId: { in: missingSeenIds } },
+                _max: { telegramId: true }
+            });
+            for (const row of rows) {
+                if (row._max.telegramId != null) {
+                    maxByChannel.set(row.channelId, Number(row._max.telegramId));
+                }
+            }
+        }
+
+        const next = new Map<number, CachedChannel>();
+        for (const channel of channels) {
+            const prev = this.channelCache.get(channel.id);
+            next.set(channel.id, {
+                ...channel,
+                lastScrapedAt: prev?.lastScrapedAt ?? null,
+                lastSeenTelegramId: prev?.lastSeenTelegramId ?? maxByChannel.get(channel.id)
+            });
+        }
+        this.channelCache = next;
+        this.lastCacheRefreshAt = Date.now();
     }
 
     private getWorkerPath(): string {
@@ -227,7 +280,7 @@ export class Scraper {
         const isTS = __filename.endsWith('.ts');
         const worker = new Worker(this.getWorkerPath(), {
             execArgv: isTS ? ['-r', 'ts-node/register'] : [],
-            workerData: { isTS }
+            workerData: { isTS, preferredHost: getPreferredHost() }
         });
         const entry: PoolEntry = { worker, busy: false };
 
@@ -236,10 +289,7 @@ export class Scraper {
             logger.error('Worker crash', undefined, { error: err });
             if (entry.currentJob) {
                 this.inFlight.delete(entry.currentJob.channelId);
-                this.failureBackoffUntil.set(
-                    entry.currentJob.channelId,
-                    Date.now() + Scraper.FAILURE_BACKOFF_MS
-                );
+                this.markScrapeFailure(entry.currentJob.channelId);
             }
             entry.busy = false;
             entry.currentJob = undefined;
@@ -251,10 +301,7 @@ export class Scraper {
             if (code !== 0) logger.warn(`Worker exited with code ${code}`);
             if (entry.currentJob) {
                 this.inFlight.delete(entry.currentJob.channelId);
-                this.failureBackoffUntil.set(
-                    entry.currentJob.channelId,
-                    Date.now() + Scraper.FAILURE_BACKOFF_MS
-                );
+                this.markScrapeFailure(entry.currentJob.channelId);
             }
             entry.busy = false;
             entry.currentJob = undefined;
@@ -272,7 +319,7 @@ export class Scraper {
     }
 
     private replacePoolWorker() {
-        if (this.shuttingDownPool || !this.poolWanted || !this.isRunning || !this.enabled()) return;
+        if (!this.isRunning) return;
         if (this.pool.length >= this.poolSize) return;
         this.pool.push(this.createPoolWorker());
     }
@@ -309,7 +356,8 @@ export class Scraper {
             ) {
                 this.jobQueue.push({
                     channelId: channel.id,
-                    username: channel.link.split('/').pop() || ''
+                    username: channel.link.split('/').pop() || '',
+                    afterTelegramId: channel.lastSeenTelegramId
                 });
             }
         }

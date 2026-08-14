@@ -2,7 +2,8 @@ import { parentPort } from 'worker_threads';
 import * as cheerio from 'cheerio';
 import { fetchChannelHtml } from './telegramWebScrape';
 
-// Types (replicated here or imported if shared)
+type CheerioRoot = ReturnType<typeof cheerio.load>;
+
 interface ScrapedMessage {
     telegramId: number;
     text: string;
@@ -15,6 +16,7 @@ interface ScrapedMessage {
 interface WorkerJob {
     username: string;
     channelId: number;
+    afterTelegramId?: number;
 }
 
 interface WorkerResult {
@@ -22,100 +24,116 @@ interface WorkerResult {
     channelId: number;
     username: string;
     messages?: ScrapedMessage[];
+    maxTelegramId?: number;
     error?: any;
     log?: string;
 }
 
-// Function to scrape a single channel
-async function scrapeChannel(username: string): Promise<ScrapedMessage[]> {
-    const html = await fetchChannelHtml(username);
-    const $ = cheerio.load(html);
-    const messages: ScrapedMessage[] = [];
+function parseMessageId($: CheerioRoot, element: any): number | null {
+    const dataId = $(element).find('.tgme_widget_message').attr('data-post');
+    if (!dataId) return null;
+    const messageId = parseInt(dataId.split('/').pop() || '0', 10);
+    return Number.isFinite(messageId) && messageId > 0 ? messageId : null;
+}
 
-    $('.tgme_widget_message_wrap').each((_, element) => {
-        const msgNode = $(element).find('.tgme_widget_message');
-        const dataId = msgNode.attr('data-post');
+function parseMessage($: CheerioRoot, element: any, messageId: number): ScrapedMessage | null {
+    const msgNode = $(element).find('.tgme_widget_message');
 
-        if (!dataId) return;
+    const textNode = msgNode.find('.tgme_widget_message_text.js-message_text');
+    textNode.find('.tgme_widget_message_reply').remove();
+    textNode.find('.tgme_widget_message_author_name').remove();
+    textNode.find('br').replaceWith('\n');
 
-        const messageId = parseInt(dataId.split('/').pop() || '0', 10);
+    const text = textNode.text().trim();
+    const timeStr = msgNode.find('time').attr('datetime');
 
-        // Find text node and strip citations/replies
-        const textNode = msgNode.find('.tgme_widget_message_text.js-message_text');
-        textNode.find('.tgme_widget_message_reply').remove();
-        textNode.find('.tgme_widget_message_author_name').remove();
+    if (!text && !msgNode.find('.tgme_widget_message_photo').length && !msgNode.find('.tgme_widget_message_video').length) return null;
+    if (!timeStr) return null;
 
-        // Preserve line breaks
-        textNode.find('br').replaceWith('\n');
+    let mediaUrl: string | undefined;
+    let mediaType: 'photo' | 'video' | undefined;
 
-        const text = textNode.text().trim();
-        const timeStr = msgNode.find('time').attr('datetime');
-
-        if (!text && !msgNode.find('.tgme_widget_message_photo').length && !msgNode.find('.tgme_widget_message_video').length) return;
-        if (!timeStr) return;
-
-        let mediaUrl: string | undefined;
-        let mediaType: 'photo' | 'video' | undefined;
-
-        // Try to find photo
-        const photoNode = msgNode.find('.tgme_widget_message_photo_wrap');
-        if (photoNode.length) {
-            const style = photoNode.attr('style');
-            const match = style?.match(/background-image:url\(['"](.+?)['"]\)/);
-            if (match && match[1]) {
-                mediaUrl = match[1];
-                mediaType = 'photo';
-            }
+    const photoNode = msgNode.find('.tgme_widget_message_photo_wrap');
+    if (photoNode.length) {
+        const style = photoNode.attr('style');
+        const match = style?.match(/background-image:url\(['"](.+?)['"]\)/);
+        if (match && match[1]) {
+            mediaUrl = match[1];
+            mediaType = 'photo';
         }
+    }
 
-        // Try to find video
-        if (!mediaUrl) {
-            const videoNode = msgNode.find('.tgme_widget_message_video');
-            if (videoNode.length) {
-                // Usually video is behind a link or in a video tag
-                const videoTag = videoNode.find('video');
-                if (videoTag.length) {
-                    mediaUrl = videoTag.attr('src');
-                    mediaType = 'video';
-                } else {
-                    // Sometimes it's just a class with a background image preview
-                    // For truly obtaining video we would need the direct link, but let's try the preview for now or common patterns
-                    mediaUrl = videoNode.attr('src'); // Check if src is directly there
-                    if (!mediaUrl) {
-                        const style = videoNode.attr('style');
-                        const match = style?.match(/background-image:url\(['"](.+?)['"]\)/);
-                        if (match && match[1]) {
-                            mediaUrl = match[1];
-                            mediaType = 'video'; // Mark as video even if we only have preview
-                        }
+    if (!mediaUrl) {
+        const videoNode = msgNode.find('.tgme_widget_message_video');
+        if (videoNode.length) {
+            const videoTag = videoNode.find('video');
+            if (videoTag.length) {
+                mediaUrl = videoTag.attr('src');
+                mediaType = 'video';
+            } else {
+                mediaUrl = videoNode.attr('src');
+                if (!mediaUrl) {
+                    const style = videoNode.attr('style');
+                    const match = style?.match(/background-image:url\(['"](.+?)['"]\)/);
+                    if (match && match[1]) {
+                        mediaUrl = match[1];
+                        mediaType = 'video';
                     }
                 }
             }
         }
+    }
 
-        messages.push({
-            telegramId: messageId,
-            text: text,
-            mediaUrl,
-            mediaType,
-            date: new Date(timeStr),
-            sender: msgNode.find('.tgme_widget_message_from_author').text().trim() || undefined,
-        });
-    });
-
-    return messages;
+    return {
+        telegramId: messageId,
+        text,
+        mediaUrl,
+        mediaType,
+        date: new Date(timeStr),
+        sender: msgNode.find('.tgme_widget_message_from_author').text().trim() || undefined,
+    };
 }
 
-// Listen for messages from the main thread
+async function scrapeChannel(username: string, afterTelegramId?: number): Promise<{ messages: ScrapedMessage[]; maxTelegramId?: number }> {
+    const html = await fetchChannelHtml(username);
+    const $ = cheerio.load(html);
+    const wraps = $('.tgme_widget_message_wrap').toArray();
+    if (wraps.length === 0) return { messages: [] };
+
+    const firstId = parseMessageId($, wraps[0]);
+    const lastId = parseMessageId($, wraps[wraps.length - 1]);
+    const newestFirst = firstId != null && lastId != null && firstId >= lastId;
+    const ordered = newestFirst ? wraps : [...wraps].reverse();
+
+    const messages: ScrapedMessage[] = [];
+    let maxTelegramId = afterTelegramId ?? 0;
+
+    for (const element of ordered) {
+        const messageId = parseMessageId($, element);
+        if (messageId == null) continue;
+        if (messageId > maxTelegramId) maxTelegramId = messageId;
+        if (afterTelegramId && messageId <= afterTelegramId) break;
+
+        const parsed = parseMessage($, element, messageId);
+        if (parsed) messages.push(parsed);
+    }
+
+    return {
+        messages,
+        maxTelegramId: maxTelegramId > 0 ? maxTelegramId : undefined
+    };
+}
+
 if (parentPort) {
     parentPort.on('message', async (job: WorkerJob) => {
         try {
-            const messages = await scrapeChannel(job.username);
+            const { messages, maxTelegramId } = await scrapeChannel(job.username, job.afterTelegramId);
             const result: WorkerResult = {
                 success: true,
                 channelId: job.channelId,
                 username: job.username,
-                messages
+                messages,
+                maxTelegramId
             };
             parentPort?.postMessage(result);
         } catch (error) {

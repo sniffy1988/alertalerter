@@ -2,6 +2,7 @@ import { Bot, InlineKeyboard, Keyboard } from 'grammy';
 import prisma from './db';
 import { logger } from './logger';
 import { t, Locale } from './i18n';
+import { notifyScraperChannelAdded } from './scrapper';
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -113,6 +114,22 @@ const notifyAllUsersOfNewChannel = async (channelName: string) => {
     } catch (error) {
         logger.error('New channel notification error', undefined, { error });
     }
+};
+
+const upsertWatchedChannel = async (cleanLink: string) => {
+    const existing = await prisma.channel.findUnique({ where: { link: cleanLink } });
+    const channel = await prisma.channel.upsert({
+        where: { link: cleanLink },
+        update: { scrapTimeout: 2500 },
+        create: { link: cleanLink, name: cleanLink, scrapTimeout: 2500 }
+    });
+    notifyScraperChannelAdded({
+        id: channel.id,
+        link: channel.link,
+        scrapTimeout: channel.scrapTimeout,
+        name: channel.name
+    });
+    return { existing, channel };
 };
 
 export const notifyAdminsBotAlive = async () => {
@@ -463,12 +480,7 @@ bot.command('addchannel', async (ctx) => {
     const cleanLink = link.split('/').pop()?.replace('@', '') || '';
 
     try {
-        const existing = await prisma.channel.findUnique({ where: { link: cleanLink } });
-        await prisma.channel.upsert({
-            where: { link: cleanLink },
-            update: { scrapTimeout: 2500 },
-            create: { link: cleanLink, name: cleanLink, scrapTimeout: 2500 }
-        });
+        const { existing } = await upsertWatchedChannel(cleanLink);
         await ctx.reply(`📺 Channel **@${cleanLink}** added!`, { parse_mode: 'Markdown' });
 
         if (!existing) {
@@ -533,12 +545,7 @@ bot.on('message', async (ctx) => {
         if (state === 'await_channel') {
             const cleanLink = text.split('/').pop()?.replace('@', '') || '';
             try {
-                const existing = await prisma.channel.findUnique({ where: { link: cleanLink } });
-                await prisma.channel.upsert({
-                    where: { link: cleanLink },
-                    update: { scrapTimeout: 2500 },
-                    create: { link: cleanLink, name: cleanLink, scrapTimeout: 2500 }
-                });
+                const { existing } = await upsertWatchedChannel(cleanLink);
                 adminState[userIdNum] = null;
                 await ctx.reply(`📺 Channel **@${cleanLink}** added!`, { parse_mode: 'Markdown' });
 

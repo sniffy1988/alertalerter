@@ -2,27 +2,20 @@
 
 Telegram channel scrapper and notification bot.
 
-Ingest is **MTProto (GramJS) first**, with **t.me scrape as fallback** until GramJS has received a recent channel post. The same Telegram user session must not run in two places (local `npm run dev` and Docker) at once.
+Ingest is **t.me / telegram.me HTML scrape** of public channel preview pages. Alerts go out through the Telegram Bot API (`TELEGRAM_BOT_TOKEN`).
 
 ## Setup (Local)
 
 1. **Install dependencies**: `npm install`
-2. **Environment**: Copy `.env.example` to `.env`. Set `TELEGRAM_BOT_TOKEN`, and for MTProto also `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and `TELEGRAM_USER_SESSION` (or `TELEGRAM_SESSION_PATH`). Optional: `INGEST_MODE=auto` (default), `SCRAPER_POOL_SIZE=2`, `ALERT_SEND_CONCURRENCY=8`.
-3. **Session**: `npm run build && npm run telegram:auth` once if you do not have a session yet.
-4. **Database**: `npx prisma migrate dev`
-5. **Run**: `npm run dev`
-
-If Docker is already using the same session, stop it first: `docker compose stop app`.
-
-Confirm MTProto:
+2. **Environment**: Copy `.env.example` to `.env`. Set `TELEGRAM_BOT_TOKEN`. Optional: `SCRAPER_POOL_SIZE=4`, `ALERT_SEND_CONCURRENCY=8`.
+3. **Database**: `npx prisma migrate dev`
+4. **Run**: `npm run dev`
 
 ```bash
-# after a real post in a watched channel
-# log line: MTProto push received
 curl -s http://127.0.0.1:8080/health
 ```
 
-`/health` JSON includes `ingestMode`, `mtprotoHealthy`, `watchedChannels`, `lastMessageAt`, `scrapeActive`. `/` still returns `OK` for Docker healthchecks.
+`/health` JSON includes `channelCount`, `scrapeActive`, `poolSize`, `lastScrapeAt`. `/` still returns `OK` for Docker healthchecks.
 
 ## Docker Deployment (Mac mini / Proxmox / Server)
 
@@ -30,7 +23,7 @@ CI builds and pushes a **multi-arch** image (`linux/amd64` + `linux/arm64`) to G
 
 ### Mac mini (Docker Desktop)
 
-1. Copy `docker-compose.yml` and create `.env` with `TELEGRAM_BOT_TOKEN` (and MTProto vars).
+1. Copy `docker-compose.yml` and create `.env` with `TELEGRAM_BOT_TOKEN`.
 2. Pull and start (Prisma Studio is **off** unless you pass the profile):
 
 ```bash
@@ -71,8 +64,7 @@ services:
     environment:
       - DATABASE_URL=file:/database/alerts.db
       - TELEGRAM_BOT_TOKEN=your_bot_token_here
-      - INGEST_MODE=auto
-      - SCRAPER_POOL_SIZE=2
+      - SCRAPER_POOL_SIZE=4
       - ALERT_SEND_CONCURRENCY=8
     volumes:
       # Change './db_data' to any absolute path on your host (e.g. /mnt/data/mybot)
@@ -108,7 +100,7 @@ Start with `docker compose --profile studio up -d` and open:
 `http://your-server-ip:5555`
 
 ## Features
-*   **MTProto ingest**: GramJS user client for channel posts; t.me scrape only as fallback.
-*   **Worker Threads**: Small scrape pool (`SCRAPER_POOL_SIZE`, default 2) when fallback is on.
+*   **Web scrape ingest**: polls public `t.me/s/{username}` preview pages.
+*   **Worker Threads**: scrape pool (`SCRAPER_POOL_SIZE`, default 4).
 *   **External DB**: SQLite file persistence via Docker volumes.
 *   **Menu System**: Persistent bot keyboard for settings and subs.

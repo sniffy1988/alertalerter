@@ -2,8 +2,6 @@ import prisma from './db';
 import { logger } from './logger';
 import { emitAlerts } from './alertBus';
 
-export type IngestSource = 'mtproto' | 'scrape';
-
 export type IncomingMessage = {
     telegramId: number;
     text: string;
@@ -129,8 +127,7 @@ export class MessageProcessor {
 
     async processIncomingMessages(
         channelId: number,
-        messages: IncomingMessage[],
-        source: IngestSource
+        messages: IncomingMessage[]
     ): Promise<{ processed: number; persisted: number }> {
         if (messages.length === 0) return { processed: 0, persisted: 0 };
 
@@ -180,14 +177,14 @@ export class MessageProcessor {
                 this.includeRules.some(p => normalizedText.includes(p));
 
             if (passedFilter) {
-                logger.info(`New message (${source})`, channelId, {
+                logger.info('New message', channelId, {
                     telegramId: msg.telegramId,
                     preview: previewMessageText(cleanedText),
                     matchedFilter: true,
                     hasMedia: !!(msg.mediaUrl || msg.mediaType)
                 });
             } else {
-                logger.debug(`New message (${source})`, channelId, {
+                logger.debug('New message', channelId, {
                     telegramId: msg.telegramId,
                     preview: previewMessageText(cleanedText),
                     matchedFilter: false,
@@ -242,7 +239,7 @@ export class MessageProcessor {
                     subscriberIds
                 });
                 prepared.forEach(p =>
-                    logger.info(`🚨 Alert queued (${source}) for ${p.telegramId}`, channelId)
+                    logger.info(`🚨 Alert queued for ${p.telegramId}`, channelId)
                 );
             }
         }
@@ -272,12 +269,12 @@ export class MessageProcessor {
                         })
                     )
                 );
-                logger.info(`Persisted ${results.length} message(s) (${source})`, channelId, {
+                logger.info(`Persisted ${results.length} message(s)`, channelId, {
                     attempted: allMessagesToPersist.length
                 });
                 return { processed: messages.length, persisted: results.length };
             } catch (e) {
-                logger.error(`Failed to persist messages (${source})`, channelId, { error: e });
+                logger.error('Failed to persist messages', channelId, { error: e });
             }
         }
 
