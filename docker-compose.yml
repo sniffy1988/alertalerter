@@ -13,6 +13,7 @@ services:
     environment:
       - DATABASE_URL=file:/database/alerts.db
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - SCRAPER_POOL_SIZE=${SCRAPER_POOL_SIZE:-4}
       - ALERT_SEND_CONCURRENCY=${ALERT_SEND_CONCURRENCY:-8}
       - NODE_ENV=production
       - LOG_LEVEL=info

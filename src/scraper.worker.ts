@@ -1,13 +1,8 @@
-import { parentPort, workerData } from 'worker_threads';
+import { parentPort } from 'worker_threads';
 import * as cheerio from 'cheerio';
 import { fetchChannelHtml } from './telegramWebScrape';
 
 type CheerioRoot = ReturnType<typeof cheerio.load>;
-
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const FAILURE_BACKOFF_START_MS = 1_000;
-const FAILURE_BACKOFF_CAP_MS = 30_000;
 
 interface ScrapedMessage {
     telegramId: number;
@@ -18,6 +13,12 @@ interface ScrapedMessage {
     sender?: string;
 }
 
+interface WorkerJob {
+    username: string;
+    channelId: number;
+    afterTelegramId?: number;
+}
+
 interface WorkerResult {
     success: boolean;
     channelId: number;
@@ -25,36 +26,7 @@ interface WorkerResult {
     messages?: ScrapedMessage[];
     maxTelegramId?: number;
     error?: any;
-}
-
-type ChannelConfig = {
-    channelId: number;
-    username: string;
-    scrapTimeout: number;
-    afterTelegramId?: number;
-};
-
-function intervalMs(value: unknown): number {
-    const n = Number(value);
-    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 60_000;
-}
-
-const config: ChannelConfig = {
-    channelId: Number(workerData.channelId),
-    username: String(workerData.username ?? ''),
-    scrapTimeout: intervalMs(workerData.scrapTimeout),
-    afterTelegramId: typeof workerData.afterTelegramId === 'number' ? workerData.afterTelegramId : undefined
-};
-
-if (parentPort) {
-    parentPort.on('message', (msg: { type?: string; username?: string; scrapTimeout?: number; afterTelegramId?: number }) => {
-        if (msg?.type !== 'config') return;
-        if (typeof msg.username === 'string' && msg.username) config.username = msg.username;
-        if (msg.scrapTimeout != null) config.scrapTimeout = intervalMs(msg.scrapTimeout);
-        if (typeof msg.afterTelegramId === 'number') {
-            config.afterTelegramId = Math.max(config.afterTelegramId ?? 0, msg.afterTelegramId);
-        }
-    });
+    log?: string;
 }
 
 function parseMessageId($: CheerioRoot, element: any): number | null {
@@ -152,47 +124,26 @@ async function scrapeChannel(username: string, afterTelegramId?: number): Promis
     };
 }
 
-async function runLoop(): Promise<void> {
-    let failureStreak = 0;
-
-    while (true) {
-        const started = Date.now();
+if (parentPort) {
+    parentPort.on('message', async (job: WorkerJob) => {
         try {
-            const { messages, maxTelegramId } = await scrapeChannel(config.username, config.afterTelegramId);
-            if (maxTelegramId != null) {
-                config.afterTelegramId = Math.max(config.afterTelegramId ?? 0, maxTelegramId);
-            }
-            failureStreak = 0;
-
+            const { messages, maxTelegramId } = await scrapeChannel(job.username, job.afterTelegramId);
             const result: WorkerResult = {
                 success: true,
-                channelId: config.channelId,
-                username: config.username,
+                channelId: job.channelId,
+                username: job.username,
                 messages,
                 maxTelegramId
             };
             parentPort?.postMessage(result);
-
-            const wait = Math.max(0, config.scrapTimeout - (Date.now() - started));
-            await delay(wait);
         } catch (error) {
-            failureStreak += 1;
-            const backoffMs = Math.min(
-                FAILURE_BACKOFF_CAP_MS,
-                FAILURE_BACKOFF_START_MS * 2 ** (failureStreak - 1)
-            );
             const result: WorkerResult = {
                 success: false,
-                channelId: config.channelId,
-                username: config.username,
+                channelId: job.channelId,
+                username: job.username,
                 error: (error as Error).message
             };
             parentPort?.postMessage(result);
-            await delay(backoffMs);
         }
-    }
-}
-
-if (parentPort) {
-    void runLoop();
+    });
 }

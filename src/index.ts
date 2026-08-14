@@ -9,7 +9,7 @@ async function main() {
     console.log('Starting app...');
 
     const processor = new MessageProcessor();
-    const scraper = new Scraper(processor);
+    const scraper = new Scraper(0.2, processor);
 
     const healthServer = http.createServer((req, res) => {
         if (req.url === '/health') {
