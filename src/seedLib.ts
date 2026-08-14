@@ -82,8 +82,6 @@ export function normalizeChannelLink(link: string): string {
 }
 
 export async function syncSeedChannels(prisma: PrismaClient): Promise<void> {
-    const allowedLinks = new Set(SEED_CHANNELS.map(c => c.link));
-
     const existing = await prisma.channel.findMany({
         orderBy: { id: 'asc' }
     });
@@ -131,40 +129,23 @@ export async function syncSeedChannels(prisma: PrismaClient): Promise<void> {
         }
     }
 
-    const channelsAfterMerge = await prisma.channel.findMany();
-    for (const channel of channelsAfterMerge) {
-        const normalized = normalizeChannelLink(channel.link);
-        if (allowedLinks.has(normalized)) continue;
-
-        await prisma.message.deleteMany({ where: { channelId: channel.id } });
-        await prisma.channel.update({
-            where: { id: channel.id },
-            data: { subscribers: { set: [] } }
-        });
-        await prisma.channel.delete({ where: { id: channel.id } });
-        console.log(`Removed channel not in seed: ${channel.link}`);
+    const count = await prisma.channel.count();
+    if (count > 0) {
+        console.log(`Skipping channel seed; ${count} channel(s) already in DB`);
+        return;
     }
 
-    for (const channel of SEED_CHANNELS) {
-        await prisma.channel.upsert({
-            where: { link: channel.link },
-            update: {
-                name: channel.name,
-                scrapTimeout: channel.scrapTimeout
-            },
-            create: channel
-        });
-        console.log(`Upserted Channel: ${channel.name}`);
-    }
+    await prisma.channel.createMany({ data: SEED_CHANNELS });
+    console.log(`Seeded ${SEED_CHANNELS.length} channel(s)`);
 }
 
 export async function syncSeedFilterPhrases(prisma: PrismaClient): Promise<void> {
-    for (const rule of SEED_FILTER_PHRASES) {
-        await prisma.filterPhrase.upsert({
-            where: { phrase: rule.phrase },
-            update: { exclude: rule.exclude },
-            create: rule
-        });
+    const count = await prisma.filterPhrase.count();
+    if (count > 0) {
+        console.log(`Skipping filter seed; ${count} phrase(s) already in DB`);
+        return;
     }
-    console.log('Seeded Filter Dictionary to DB');
+
+    await prisma.filterPhrase.createMany({ data: SEED_FILTER_PHRASES });
+    console.log(`Seeded ${SEED_FILTER_PHRASES.length} filter phrase(s)`);
 }
