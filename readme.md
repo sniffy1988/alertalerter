@@ -7,7 +7,7 @@ Ingest is **t.me / telegram.me HTML scrape** of public channel preview pages. Al
 ## Setup (Local)
 
 1. **Install dependencies**: `npm install`
-2. **Environment**: Copy `.env.example` to `.env`. Set `TELEGRAM_BOT_TOKEN`. Optional: `SCRAPER_POOL_SIZE=4`, `ALERT_SEND_CONCURRENCY=8`.
+2. **Environment**: Copy `.env.example` to `.env`. Set `TELEGRAM_BOT_TOKEN`. Optional: `ALERT_SEND_CONCURRENCY=8`.
 3. **Database**: `npx prisma migrate dev`
 4. **Run**: `npm run dev`
 
@@ -15,7 +15,7 @@ Ingest is **t.me / telegram.me HTML scrape** of public channel preview pages. Al
 curl -s http://127.0.0.1:8080/health
 ```
 
-`/health` JSON includes `channelCount`, `scrapeActive`, `poolSize`, `lastScrapeAt`. `/` still returns `OK` for Docker healthchecks.
+`/health` JSON includes `channelCount`, `scrapeActive`, `workers`, `lastScrapeAt`, and per-channel `intervalMs` from `Channel.scrapTimeout`. `/` still returns `OK` for Docker healthchecks.
 
 ## Docker Deployment (Mac mini / Proxmox / Server)
 
@@ -64,7 +64,6 @@ services:
     environment:
       - DATABASE_URL=file:/database/alerts.db
       - TELEGRAM_BOT_TOKEN=your_bot_token_here
-      - SCRAPER_POOL_SIZE=4
       - ALERT_SEND_CONCURRENCY=8
     volumes:
       # Change './db_data' to any absolute path on your host (e.g. /mnt/data/mybot)
@@ -101,6 +100,6 @@ Start with `docker compose --profile studio up -d` and open:
 
 ## Features
 *   **Web scrape ingest**: polls public `t.me/s/{username}` preview pages.
-*   **Worker Threads**: scrape pool (`SCRAPER_POOL_SIZE`, default 4).
+*   **Worker Threads**: one long-lived worker per watched channel, polling on that channel's `scrapTimeout`.
 *   **External DB**: SQLite file persistence via Docker volumes.
 *   **Menu System**: Persistent bot keyboard for settings and subs.
