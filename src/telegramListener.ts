@@ -6,7 +6,7 @@ import { Api } from 'telegram/tl';
 import { utils } from 'telegram';
 import prisma from './db';
 import { logger } from './logger';
-import { MessageProcessor, type IncomingMessage, previewMessageText } from './messageProcessor';
+import { MessageProcessor, type IncomingMessage } from './messageProcessor';
 import { peerIdAliases, resolvePeerIdFromEntity } from './telegramPeerId';
 import {
     getApiCredentials,
@@ -18,7 +18,6 @@ type ChannelMapping = { channelId: number; username: string; peerId: string };
 
 const KEEP_ALIVE_MS = 30_000;
 const RECONNECT_MS = 30_000;
-const RAW_UPDATE_LOG_LIMIT = 40;
 
 export class TelegramListener {
     private client: TelegramClient | null = null;
@@ -34,7 +33,6 @@ export class TelegramListener {
     private readonly groupedSeen = new Set<string>();
     private readonly boundHandler: (event: NewMessageEvent) => Promise<void>;
     private lastMessageAt = 0;
-    private rawUpdateLogs = 0;
 
     constructor(private readonly processor: MessageProcessor) {
         this.boundHandler = (event) => this.handleNewMessage(event);
@@ -121,7 +119,6 @@ export class TelegramListener {
             }
 
             this.handlerRegistered = false;
-            this.rawUpdateLogs = 0;
             this.client = new TelegramClient(session, apiId, apiHash, {
                 connectionRetries: 5
             });
@@ -262,8 +259,55 @@ export class TelegramListener {
         this.handlerRegistered = true;
     }
 
+    private updateClassName(update: unknown): string {
+        if (update && typeof update === 'object' && 'className' in update) {
+            return String((update as { className?: string }).className);
+        }
+        return update?.constructor?.name ?? typeof update;
+    }
+
+    private describeApiMessage(msg: Api.Message): Record<string, unknown> {
+        let peerId: string | undefined;
+        try {
+            peerId = msg.peerId ? utils.getPeerId(msg.peerId).toString() : undefined;
+        } catch {
+            peerId = String(msg.peerId);
+        }
+        const text = msg.message || (msg.media ? '(media)' : '');
+        return {
+            telegramId: msg.id,
+            peerId,
+            out: msg.out,
+            post: msg.post,
+            editDate: msg.editDate,
+            hasMedia: !!msg.media,
+            text: text.length > 4000 ? `${text.slice(0, 4000)}…` : text
+        };
+    }
+
+    private describeUpdate(update: unknown): Record<string, unknown> {
+        const className = this.updateClassName(update);
+        const payload: Record<string, unknown> = { className };
+
+        if (
+            update instanceof Api.UpdateNewChannelMessage ||
+            update instanceof Api.UpdateNewMessage ||
+            update instanceof Api.UpdateEditChannelMessage ||
+            update instanceof Api.UpdateEditMessage
+        ) {
+            if (update.message instanceof Api.Message) {
+                Object.assign(payload, this.describeApiMessage(update.message));
+            } else {
+                payload.messageType = update.message?.className ?? typeof update.message;
+            }
+        }
+
+        return payload;
+    }
+
     private async onRawUpdate(update: unknown): Promise<void> {
         if (update instanceof UpdateConnectionState) {
+            logger.info('MTProto connection update', undefined, { state: update.state });
             if (update.state === UpdateConnectionState.connected) {
                 if (!this.healthy && this.client?.connected) {
                     this.healthy = true;
@@ -276,16 +320,10 @@ export class TelegramListener {
             return;
         }
 
-        const className =
-            update && typeof update === 'object' && 'className' in update
-                ? String((update as { className?: string }).className)
-                : update?.constructor?.name;
+        const details = this.describeUpdate(update);
+        logger.info('MTProto received', undefined, details);
 
-        if (this.rawUpdateLogs < RAW_UPDATE_LOG_LIMIT) {
-            this.rawUpdateLogs++;
-            logger.info('MTProto raw update', undefined, { className, n: this.rawUpdateLogs });
-        }
-
+        const className = String(details.className);
         if (className === 'UpdatesTooLong') {
             await this.fetchAccountDifference();
             return;
@@ -298,6 +336,13 @@ export class TelegramListener {
             const message = update.message;
             if (message instanceof Api.Message) {
                 await this.ingestApiMessage(message);
+            } else {
+                logger.info('MTProto message update without Api.Message', undefined, {
+                    className,
+                    inner: message && typeof message === 'object' && 'className' in message
+                        ? (message as { className?: string }).className
+                        : typeof message
+                });
             }
         }
     }
@@ -332,7 +377,14 @@ export class TelegramListener {
 
     private async handleNewMessage(event: NewMessageEvent): Promise<void> {
         try {
-            if (!event.isChannel) return;
+            if (!event.isChannel) {
+                logger.debug('MTProto NewMessage skipped (not channel)', undefined, {
+                    chatId: event.chatId?.toString(),
+                    isPrivate: event.isPrivate,
+                    isGroup: event.isGroup
+                });
+                return;
+            }
             await this.ingestApiMessage(event.message);
         } catch (err) {
             logger.error('MTProto message handler error', undefined, { error: err });
@@ -341,22 +393,33 @@ export class TelegramListener {
 
     private async ingestApiMessage(msg: Api.Message): Promise<void> {
         try {
-            if (!msg.peerId) return;
+            if (!msg.peerId) {
+                logger.info('MTProto skip: no peerId', undefined, this.describeApiMessage(msg));
+                return;
+            }
             const peerId = utils.getPeerId(msg.peerId).toString();
             const mapping = this.mappingFromPeerId(peerId);
             if (!mapping) {
-                logger.warn('MTProto message from unmapped channel', undefined, {
-                    peerId,
+                logger.info('MTProto skip: unmapped peer', undefined, {
+                    ...this.describeApiMessage(msg),
                     knownPeerIds: this.watchedPeerIds
                 });
                 return;
             }
 
-            if (msg.editDate) return;
+            if (msg.editDate) {
+                logger.debug('MTProto skip: edit', mapping.channelId, this.describeApiMessage(msg));
+                return;
+            }
 
             if (msg.groupedId) {
                 const groupedKey = `${mapping.peerId}:${msg.groupedId.toString()}`;
-                if (this.groupedSeen.has(groupedKey)) return;
+                if (this.groupedSeen.has(groupedKey)) {
+                    logger.debug('MTProto skip: grouped duplicate', mapping.channelId, {
+                        groupedId: msg.groupedId.toString()
+                    });
+                    return;
+                }
                 this.groupedSeen.add(groupedKey);
                 if (this.groupedSeen.size > 1000) {
                     this.groupedSeen.clear();
@@ -367,7 +430,10 @@ export class TelegramListener {
             if (!text && msg.media) {
                 text = '(media)';
             }
-            if (!text) return;
+            if (!text) {
+                logger.info('MTProto skip: empty text', mapping.channelId, this.describeApiMessage(msg));
+                return;
+            }
 
             this.lastMessageAt = Date.now();
 
@@ -380,7 +446,7 @@ export class TelegramListener {
             logger.info('MTProto push received', mapping.channelId, {
                 channel: `@${mapping.username}`,
                 telegramId: msg.id,
-                preview: previewMessageText(text)
+                text
             });
 
             await this.processor.processIncomingMessages(mapping.channelId, [incoming], 'mtproto');
