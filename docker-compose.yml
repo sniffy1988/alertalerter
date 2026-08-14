@@ -18,6 +18,8 @@ services:
       - TELEGRAM_USER_SESSION=${TELEGRAM_USER_SESSION}
       - TELEGRAM_SESSION_PATH=/database/telegram.session
       - INGEST_MODE=${INGEST_MODE:-auto}
+      - SCRAPER_POOL_SIZE=${SCRAPER_POOL_SIZE:-2}
+      - ALERT_SEND_CONCURRENCY=${ALERT_SEND_CONCURRENCY:-8}
       - NODE_ENV=production
       - LOG_LEVEL=info
     volumes:
@@ -29,6 +31,7 @@ services:
         max-file: "3"
 
   studio:
+    profiles: ["studio"]
     image: ghcr.io/sniffy1988/alertalerter:latest
     restart: always
     command: npx prisma studio --browser none --port 5555 --hostname 0.0.0.0

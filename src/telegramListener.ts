@@ -1,6 +1,7 @@
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions';
-import { NewMessage, type NewMessageEvent } from 'telegram/events';
+import { NewMessage, Raw, type NewMessageEvent } from 'telegram/events';
+import { UpdateConnectionState } from 'telegram/network';
 import { Api } from 'telegram/tl';
 import { utils } from 'telegram';
 import prisma from './db';
@@ -15,9 +16,13 @@ import {
 
 type ChannelMapping = { channelId: number; username: string; peerId: string };
 
+const KEEP_ALIVE_MS = 30_000;
+const RECONNECT_MS = 30_000;
+
 export class TelegramListener {
     private client: TelegramClient | null = null;
     private healthy = false;
+    private connecting = false;
     private reconnectTimer: ReturnType<typeof setInterval> | null = null;
     private keepAliveTimer: ReturnType<typeof setInterval> | null = null;
     private readonly peerToChannel = new Map<string, ChannelMapping>();
@@ -41,6 +46,10 @@ export class TelegramListener {
         return this.lastMessageAt;
     }
 
+    getWatchedChannelCount(): number {
+        return this.watchedChannelCount;
+    }
+
     async start(): Promise<void> {
         try {
             await this.connect();
@@ -49,12 +58,19 @@ export class TelegramListener {
             throw err;
         }
         this.reconnectTimer = setInterval(() => {
-            if (!this.healthy) {
+            if (!this.healthy && !this.connecting) {
                 void this.connect().catch(err =>
                     logger.error('MTProto reconnect failed', undefined, { error: err })
                 );
             }
-        }, 30_000);
+        }, RECONNECT_MS);
+    }
+
+    private markUnhealthy(reason: string): void {
+        if (!this.healthy) return;
+        this.healthy = false;
+        this.stopKeepAlive();
+        logger.warn('MTProto marked unhealthy', undefined, { reason });
     }
 
     private stopKeepAlive(): void {
@@ -67,66 +83,82 @@ export class TelegramListener {
     private startKeepAlive(): void {
         this.stopKeepAlive();
         this.keepAliveTimer = setInterval(() => {
-            void this.runKeepAlive().catch(err =>
-                logger.warn('MTProto keepalive failed', undefined, { error: err })
-            );
-        }, 30_000);
+            void this.runKeepAlive().catch(err => {
+                logger.warn('MTProto keepalive failed', undefined, { error: err });
+                this.markUnhealthy('keepalive failed');
+            });
+        }, KEEP_ALIVE_MS);
     }
 
     private async runKeepAlive(): Promise<void> {
-        if (!this.client || !this.healthy) return;
-
-        await this.client.getDialogs({ limit: 100 });
-
-        for (const mapping of this.channelMappings.values()) {
-            await this.client.getEntity(mapping.username);
+        if (!this.client) return;
+        if (!this.client.connected) {
+            this.markUnhealthy('socket not connected');
+            return;
         }
+        await this.client.getMe();
     }
 
     private async connect(): Promise<void> {
+        if (this.connecting) return;
+        this.connecting = true;
         this.healthy = false;
         this.stopKeepAlive();
 
-        const { apiId, apiHash } = getApiCredentials();
-        const sessionStr = loadSessionString();
-        const session = new StringSession(sessionStr);
+        try {
+            const { apiId, apiHash } = getApiCredentials();
+            const sessionStr = loadSessionString();
+            const session = new StringSession(sessionStr);
 
-        if (this.client) {
-            try {
-                await this.client.disconnect();
-            } catch {
-                // ignore stale disconnect
+            if (this.client) {
+                try {
+                    await this.client.disconnect();
+                } catch {
+                    // ignore stale disconnect
+                }
             }
+
+            this.handlerRegistered = false;
+            this.client = new TelegramClient(session, apiId, apiHash, {
+                connectionRetries: 5
+            });
+
+            await this.client.connect();
+
+            if (!(await this.client.checkAuthorization())) {
+                throw new Error(
+                    'Telegram user session is not authorized. Run: npm run telegram:auth'
+                );
+            }
+
+            await this.client.getMe();
+            await this.client.getDialogs({ limit: 100 });
+
+            await this.setupChannels();
+            this.registerHandler();
+            await this.tryCatchUp();
+
+            const saved = session.save();
+            if (saved && saved !== sessionStr) {
+                persistSession(saved);
+            }
+
+            this.healthy = true;
+            this.startKeepAlive();
+            logger.info(`MTProto listener connected, watching ${this.watchedChannelCount} channel(s)`);
+        } finally {
+            this.connecting = false;
         }
+    }
 
-        this.handlerRegistered = false;
-        this.client = new TelegramClient(session, apiId, apiHash, {
-            connectionRetries: 5
-        });
-
-        await this.client.connect();
-
-        if (!(await this.client.checkAuthorization())) {
-            throw new Error(
-                'Telegram user session is not authorized. Run: npm run telegram:auth'
-            );
+    private async tryCatchUp(): Promise<void> {
+        const client = this.client as (TelegramClient & { catchUp?: () => void | Promise<void> }) | null;
+        if (!client || typeof client.catchUp !== 'function') return;
+        try {
+            await Promise.resolve(client.catchUp());
+        } catch (err) {
+            logger.warn('MTProto catchUp failed', undefined, { error: err });
         }
-
-        await this.client.getMe();
-        await this.client.getDialogs({ limit: 100 });
-
-        await this.setupChannels();
-        this.registerHandler();
-        await this.runKeepAlive();
-
-        const saved = session.save();
-        if (saved && saved !== sessionStr) {
-            persistSession(saved);
-        }
-
-        this.healthy = true;
-        this.startKeepAlive();
-        logger.info(`MTProto listener connected, watching ${this.watchedChannelCount} channel(s)`);
     }
 
     private registerChannelPeer(mapping: ChannelMapping): void {
@@ -195,10 +227,19 @@ export class TelegramListener {
     private registerHandler(): void {
         if (!this.client || this.handlerRegistered) return;
 
-        this.client.addEventHandler(
-            this.boundHandler,
-            new NewMessage({ incoming: true, chats: this.watchedPeerIds })
-        );
+        this.client.addEventHandler(this.boundHandler, new NewMessage({}));
+        this.client.addEventHandler((update: unknown) => {
+            if (!(update instanceof UpdateConnectionState)) return;
+            if (update.state === UpdateConnectionState.connected) {
+                if (!this.healthy && this.client?.connected) {
+                    this.healthy = true;
+                    this.startKeepAlive();
+                    logger.info('MTProto connection restored');
+                }
+                return;
+            }
+            this.markUnhealthy(`connection state ${update.state}`);
+        }, new Raw({ types: [UpdateConnectionState] }));
         this.handlerRegistered = true;
     }
 

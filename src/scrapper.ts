@@ -1,11 +1,17 @@
-import os from 'os';
 import path from 'path';
 import { Worker } from 'worker_threads';
 import prisma from './db';
 import { logger } from './logger';
 import { MessageProcessor, type IncomingMessage } from './messageProcessor';
+import { probeTelegramWebScrape } from './telegramWebScrape';
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function parsePoolSize(): number {
+    const n = Number(process.env.SCRAPER_POOL_SIZE);
+    if (Number.isFinite(n) && n >= 1) return Math.min(8, Math.floor(n));
+    return 2;
+}
 
 interface WorkerResult {
     success: boolean;
@@ -40,10 +46,13 @@ export class Scraper {
     private channelCache = new Map<number, CachedChannel>();
     private failureBackoffUntil = new Map<number, number>();
     private enabled: () => boolean;
-    private static readonly POOL_SIZE = Math.min(8, Math.max(1, 2 * os.cpus().length));
+    private shuttingDownPool = false;
+    private poolWanted = false;
+    private probed = false;
+    private readonly poolSize: number;
     private static readonly FAILURE_BACKOFF_MS = 500;
     private static readonly MIN_SLEEP_MS = 50;
-    private static readonly IDLE_SLEEP_MS = 60_000;
+    private static readonly IDLE_SLEEP_MS = 5_000;
 
     constructor(
         intervalSeconds: number = 0.2,
@@ -52,20 +61,26 @@ export class Scraper {
     ) {
         this.intervalSeconds = intervalSeconds;
         this.enabled = options.enabled ?? (() => true);
+        this.poolSize = parsePoolSize();
+    }
+
+    isPoolActive(): boolean {
+        return this.pool.length > 0;
     }
 
     public async start() {
         if (this.isRunning) return;
         this.isRunning = true;
         logger.info(
-            `Scraper ready (pool ${Scraper.POOL_SIZE}, poll ${this.intervalSeconds * 1000}ms, parallel with MTProto)`
+            `Scraper ready (pool ${this.poolSize}, poll ${this.intervalSeconds * 1000}ms, fallback when MTProto idle)`
         );
 
         await this.refreshChannelCache();
-        this.initPool();
 
         while (this.isRunning) {
             if (this.enabled()) {
+                await this.ensureWebProbe();
+                this.ensurePool();
                 try {
                     await this.triggerScrapeCycle();
                 } catch (error) {
@@ -73,8 +88,55 @@ export class Scraper {
                 }
                 await delay(this.computeSleepMs());
             } else {
+                await this.destroyPool();
                 await delay(Scraper.IDLE_SLEEP_MS);
             }
+        }
+    }
+
+    private async ensureWebProbe(): Promise<void> {
+        if (this.probed) return;
+        this.probed = true;
+        const webProbe = await probeTelegramWebScrape();
+        if (webProbe.workingHost) {
+            const failed = webProbe.attempts.filter(a => !a.ok);
+            if (failed.length > 0) {
+                logger.warn('Web scrape probe: using fallback host', undefined, {
+                    host: webProbe.workingHost,
+                    failed: failed.map(a => ({ host: a.host, error: a.error }))
+                });
+            } else {
+                logger.info('Web scrape probe OK', undefined, { host: webProbe.workingHost });
+            }
+        } else {
+            logger.error('Web scrape probe failed for all hosts', undefined, {
+                attempts: webProbe.attempts.map(a => ({ host: a.host, error: a.error }))
+            });
+        }
+    }
+
+    private ensurePool(): void {
+        if (this.pool.length > 0 || this.shuttingDownPool) return;
+        this.poolWanted = true;
+        logger.info(`Scraper workers starting (${this.poolSize})`);
+        void this.refreshChannelCache();
+        for (let i = 0; i < this.poolSize; i++) {
+            this.pool.push(this.createPoolWorker());
+        }
+    }
+
+    private async destroyPool(): Promise<void> {
+        if (this.pool.length === 0 && !this.poolWanted) return;
+        this.poolWanted = false;
+        this.shuttingDownPool = true;
+        const entries = [...this.pool];
+        this.pool = [];
+        this.jobQueue = [];
+        this.inFlight.clear();
+        await Promise.all(entries.map(e => e.worker.terminate().catch(() => 0)));
+        this.shuttingDownPool = false;
+        if (entries.length > 0) {
+            logger.info('Scraper workers stopped (MTProto healthy)');
         }
     }
 
@@ -182,7 +244,7 @@ export class Scraper {
             entry.busy = false;
             entry.currentJob = undefined;
             this.removeFromPool(entry);
-            this.replacePoolWorker(entry);
+            this.replacePoolWorker();
             this.scheduleNextCycle();
         });
         worker.on('exit', (code) => {
@@ -197,7 +259,7 @@ export class Scraper {
             entry.busy = false;
             entry.currentJob = undefined;
             this.removeFromPool(entry);
-            this.replacePoolWorker(entry);
+            this.replacePoolWorker();
             this.scheduleNextCycle();
         });
 
@@ -209,15 +271,10 @@ export class Scraper {
         if (i !== -1) this.pool.splice(i, 1);
     }
 
-    private replacePoolWorker(_removed: PoolEntry) {
-        if (!this.isRunning || this.pool.length >= Scraper.POOL_SIZE) return;
+    private replacePoolWorker() {
+        if (this.shuttingDownPool || !this.poolWanted || !this.isRunning || !this.enabled()) return;
+        if (this.pool.length >= this.poolSize) return;
         this.pool.push(this.createPoolWorker());
-    }
-
-    private initPool() {
-        for (let i = 0; i < Scraper.POOL_SIZE; i++) {
-            this.pool.push(this.createPoolWorker());
-        }
     }
 
     private getIdleWorker(): PoolEntry | undefined {

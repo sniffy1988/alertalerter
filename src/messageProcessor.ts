@@ -1,5 +1,6 @@
 import prisma from './db';
 import { logger } from './logger';
+import { emitAlerts } from './alertBus';
 
 export type IngestSource = 'mtproto' | 'scrape';
 
@@ -27,18 +28,37 @@ export function previewMessageText(text: string, max = 120): string {
     return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine;
 }
 
-type CachedRule = { phrase: string; exclude: boolean };
+function normalize(s: string): string {
+    return s.toLowerCase().replace(/[’ʼ]/g, "'").trim();
+}
+
+function esc(text: string): string {
+    return text.replace(/[_*[\]()~`>#+-=|{}.!]/g, '\\$&');
+}
+
+type CachedChannel = { name: string | null; link: string; expiresAt: number };
+type CachedSubscribers = { ids: bigint[]; expiresAt: number };
 
 export class MessageProcessor {
-    private rulesCache: CachedRule[] = [];
+    private includeRules: string[] = [];
+    private excludeRules: string[] = [];
     private lastRulesRefreshAt = 0;
     private recentlyEmitted = new Map<number, Map<string, number>>();
+    private channelCache = new Map<number, CachedChannel>();
+    private subscriberCache = new Map<number, CachedSubscribers>();
     private static readonly RULES_CACHE_TTL_MS = 60_000;
+    private static readonly LOOKUP_CACHE_TTL_MS = 30_000;
     private static readonly RECENTLY_EMITTED_TTL_MS = 60_000;
 
     private async refreshRulesCache(): Promise<void> {
         const rules = await prisma.filterPhrase.findMany();
-        this.rulesCache = rules.map(r => ({ phrase: r.phrase, exclude: r.exclude }));
+        this.includeRules = [];
+        this.excludeRules = [];
+        for (const r of rules) {
+            const phrase = normalize(r.phrase);
+            if (r.exclude) this.excludeRules.push(phrase);
+            else this.includeRules.push(phrase);
+        }
         this.lastRulesRefreshAt = Date.now();
     }
 
@@ -72,6 +92,41 @@ export class MessageProcessor {
         channelSet.set(telegramId.toString(), Date.now() + MessageProcessor.RECENTLY_EMITTED_TTL_MS);
     }
 
+    private async getChannel(channelId: number): Promise<CachedChannel | null> {
+        const cached = this.channelCache.get(channelId);
+        if (cached && cached.expiresAt > Date.now()) return cached;
+
+        const channel = await prisma.channel.findUnique({
+            where: { id: channelId },
+            select: { name: true, link: true }
+        });
+        if (!channel) return null;
+
+        const entry: CachedChannel = {
+            name: channel.name,
+            link: channel.link,
+            expiresAt: Date.now() + MessageProcessor.LOOKUP_CACHE_TTL_MS
+        };
+        this.channelCache.set(channelId, entry);
+        return entry;
+    }
+
+    private async getSubscriberIds(channelId: number): Promise<bigint[]> {
+        const cached = this.subscriberCache.get(channelId);
+        if (cached && cached.expiresAt > Date.now()) return cached.ids;
+
+        const users = await prisma.user.findMany({
+            where: { subscribedTo: { some: { id: channelId } }, silentMode: false },
+            select: { telegramId: true }
+        });
+        const ids = users.map(u => u.telegramId);
+        this.subscriberCache.set(channelId, {
+            ids,
+            expiresAt: Date.now() + MessageProcessor.LOOKUP_CACHE_TTL_MS
+        });
+        return ids;
+    }
+
     async processIncomingMessages(
         channelId: number,
         messages: IncomingMessage[],
@@ -79,23 +134,7 @@ export class MessageProcessor {
     ): Promise<{ processed: number; persisted: number }> {
         if (messages.length === 0) return { processed: 0, persisted: 0 };
 
-        const channel = await prisma.channel.findUnique({ where: { id: channelId } });
-        if (!channel) return { processed: 0, persisted: 0 };
-
-        const channelName = channel.name || channel.link || 'Alert';
         await this.ensureRulesFresh();
-
-        const subscribers = await prisma.user.findMany({
-            where: { subscribedTo: { some: { id: channelId } }, silentMode: false }
-        });
-
-        const rules = this.rulesCache;
-        const normalize = (s: string) => s.toLowerCase().replace(/[’ʼ]/g, "'").trim();
-        const esc = (text: string) => text.replace(/[_*[\]()~`>#+-=|{}.!]/g, '\\$&');
-        const escapedName = esc(channelName);
-
-        const excludeRules = rules.filter(r => r.exclude).map(r => normalize(r.phrase));
-        const includeRules = rules.filter(r => !r.exclude).map(r => normalize(r.phrase));
 
         const msgIds = messages.map(m => BigInt(m.telegramId));
         const existingMessages = await prisma.message.findMany({
@@ -103,6 +142,17 @@ export class MessageProcessor {
             select: { telegramId: true }
         });
         const existingIdsSet = new Set(existingMessages.map(m => m.telegramId.toString()));
+
+        const fresh = messages.filter(m =>
+            !existingIdsSet.has(m.telegramId.toString()) && !this.isRecentlyEmitted(channelId, m.telegramId)
+        );
+        if (fresh.length === 0) return { processed: messages.length, persisted: 0 };
+
+        const channel = await this.getChannel(channelId);
+        if (!channel) return { processed: 0, persisted: 0 };
+
+        const channelName = channel.name || channel.link || 'Alert';
+        const escapedName = esc(channelName);
 
         type MessageRow = {
             telegramId: bigint;
@@ -122,25 +172,28 @@ export class MessageProcessor {
         };
         const prepared: Prepared[] = [];
 
-        for (const msg of messages) {
-            const idStr = msg.telegramId.toString();
-            if (existingIdsSet.has(idStr) || this.isRecentlyEmitted(channelId, msg.telegramId)) {
-                logger.debug(`Skipped duplicate (${source})`, channelId, { telegramId: msg.telegramId });
-                continue;
-            }
-
+        for (const msg of fresh) {
             const cleanedText = cleanMessage(msg.text);
             const normalizedText = normalize(cleanedText);
             const passedFilter =
-                !excludeRules.some(p => normalizedText.includes(p)) &&
-                includeRules.some(p => normalizedText.includes(p));
+                !this.excludeRules.some(p => normalizedText.includes(p)) &&
+                this.includeRules.some(p => normalizedText.includes(p));
 
-            logger.info(`New message (${source})`, channelId, {
-                telegramId: msg.telegramId,
-                preview: previewMessageText(cleanedText),
-                matchedFilter: passedFilter,
-                hasMedia: !!(msg.mediaUrl || msg.mediaType)
-            });
+            if (passedFilter) {
+                logger.info(`New message (${source})`, channelId, {
+                    telegramId: msg.telegramId,
+                    preview: previewMessageText(cleanedText),
+                    matchedFilter: true,
+                    hasMedia: !!(msg.mediaUrl || msg.mediaType)
+                });
+            } else {
+                logger.debug(`New message (${source})`, channelId, {
+                    telegramId: msg.telegramId,
+                    preview: previewMessageText(cleanedText),
+                    matchedFilter: false,
+                    hasMedia: !!(msg.mediaUrl || msg.mediaType)
+                });
+            }
 
             allMessagesToPersist.push({
                 telegramId: BigInt(msg.telegramId),
@@ -171,29 +224,32 @@ export class MessageProcessor {
             });
         }
 
-        if (prepared.length > 0 && subscribers.length > 0) {
-            const { emitAlerts } = await import('./alertBus');
-            for (const p of prepared) {
-                this.markRecentlyEmitted(channelId, p.telegramId);
+        if (prepared.length > 0) {
+            const subscriberIds = await this.getSubscriberIds(channelId);
+            if (subscriberIds.length > 0) {
+                for (const p of prepared) {
+                    this.markRecentlyEmitted(channelId, p.telegramId);
+                }
+                emitAlerts({
+                    channelId,
+                    channelName,
+                    items: prepared.map(p => ({
+                        outMessage: p.outMessage,
+                        mediaUrl: p.mediaUrl,
+                        mediaType: p.mediaType,
+                        telegramId: p.telegramId
+                    })),
+                    subscriberIds
+                });
+                prepared.forEach(p =>
+                    logger.info(`🚨 Alert queued (${source}) for ${p.telegramId}`, channelId)
+                );
             }
-            emitAlerts({
-                channelId,
-                channelName,
-                items: prepared.map(p => ({
-                    outMessage: p.outMessage,
-                    mediaUrl: p.mediaUrl,
-                    mediaType: p.mediaType,
-                    telegramId: p.telegramId
-                })),
-                subscriberIds: subscribers.map(s => s.telegramId)
-            });
-            prepared.forEach(p =>
-                logger.info(`🚨 Alert queued (${source}) for ${p.telegramId}`, channelId)
-            );
         }
 
         if (allMessagesToPersist.length > 0) {
             try {
+                // SQLite does not support createMany skipDuplicates — upserts stay.
                 const results = await Promise.all(
                     allMessagesToPersist.map(m =>
                         prisma.message.upsert({

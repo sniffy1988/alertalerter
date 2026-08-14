@@ -6,13 +6,41 @@ import { registerAlertSender } from './alertSender';
 import { MessageProcessor } from './messageProcessor';
 import { TelegramListener } from './telegramListener';
 import { getIngestMode } from './telegramConfig';
-import { probeTelegramWebScrape } from './telegramWebScrape';
 import { logger } from './logger';
+
+const MTPROTO_STALE_MS = 120_000;
 
 async function main() {
     console.log('Starting app...');
 
-    const healthServer = http.createServer((_req, res) => {
+    const processor = new MessageProcessor();
+    const ingestMode = getIngestMode();
+    let listener: TelegramListener | null = null;
+    let scraper: Scraper | null = null;
+
+    const scrapeEnabled = (): boolean => {
+        if (ingestMode === 'scrape') return true;
+        if (!listener) return true;
+        if (!listener.isHealthy()) return true;
+        const last = listener.getLastMessageAt();
+        if (last === 0) return true;
+        return Date.now() - last > MTPROTO_STALE_MS;
+    };
+
+    const healthServer = http.createServer((req, res) => {
+        if (req.url === '/health') {
+            const last = listener?.getLastMessageAt() ?? 0;
+            const body = {
+                ingestMode,
+                mtprotoHealthy: listener?.isHealthy() ?? false,
+                watchedChannels: listener?.getWatchedChannelCount() ?? 0,
+                lastMessageAt: last > 0 ? new Date(last).toISOString() : null,
+                scrapeActive: scraper?.isPoolActive() ?? false
+            };
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(body));
+            return;
+        }
         res.writeHead(200);
         res.end('OK');
     });
@@ -29,10 +57,6 @@ async function main() {
 
     registerAlertSender();
 
-    const processor = new MessageProcessor();
-    const ingestMode = getIngestMode();
-    let listener: TelegramListener | null = null;
-
     if (ingestMode === 'mtproto') {
         listener = new TelegramListener(processor);
         try {
@@ -45,24 +69,7 @@ async function main() {
         logger.info('Ingest mode: web scrape only (t.me / telegram.me; set TELEGRAM_API_ID/HASH/SESSION for MTProto)');
     }
 
-    const webProbe = await probeTelegramWebScrape();
-    if (webProbe.workingHost) {
-        const failed = webProbe.attempts.filter(a => !a.ok);
-        if (failed.length > 0) {
-            logger.warn('Web scrape probe: using fallback host', undefined, {
-                host: webProbe.workingHost,
-                failed: failed.map(a => ({ host: a.host, error: a.error }))
-            });
-        } else {
-            logger.info('Web scrape probe OK', undefined, { host: webProbe.workingHost });
-        }
-    } else {
-        logger.error('Web scrape probe failed for all hosts', undefined, {
-            attempts: webProbe.attempts.map(a => ({ host: a.host, error: a.error }))
-        });
-    }
-
-    const scraper = new Scraper(0.2, processor);
+    scraper = new Scraper(0.2, processor, { enabled: scrapeEnabled });
     void scraper.start();
 }
 

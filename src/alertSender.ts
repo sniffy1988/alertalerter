@@ -2,7 +2,13 @@ import { bot } from './bot';
 import { onAlerts, type AlertsPayload, type AlertItem } from './alertBus';
 import { logger } from './logger';
 
-const SEND_CONCURRENCY = 25;
+function parseSendConcurrency(): number {
+    const n = Number(process.env.ALERT_SEND_CONCURRENCY);
+    if (Number.isFinite(n) && n >= 1) return Math.min(25, Math.floor(n));
+    return 8;
+}
+
+const SEND_CONCURRENCY = parseSendConcurrency();
 
 class Semaphore {
     private active = 0;
@@ -44,19 +50,21 @@ async function sendWithRetry(
     await sendSemaphore.acquire();
     try {
         await sendFn();
+        return;
     } catch (err) {
         const retryAfter = getRetryAfterMs(err);
-        if (retryAfter != null) {
-            await new Promise(r => setTimeout(r, retryAfter));
-            try {
-                await sendFn();
-                return;
-            } catch (retryErr) {
-                logger.error('Alert send failed after retry', channelId, { chatId, error: retryErr });
-                return;
-            }
+        if (retryAfter == null) {
+            logger.error('Alert send failed', channelId, { chatId, error: err });
+            return;
         }
-        logger.error('Alert send failed', channelId, { chatId, error: err });
+        sendSemaphore.release();
+        await new Promise(r => setTimeout(r, retryAfter));
+        await sendSemaphore.acquire();
+        try {
+            await sendFn();
+        } catch (retryErr) {
+            logger.error('Alert send failed after retry', channelId, { chatId, error: retryErr });
+        }
     } finally {
         sendSemaphore.release();
     }
