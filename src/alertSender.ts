@@ -70,19 +70,46 @@ async function sendWithRetry(
     }
 }
 
+function formatDeliveryLag(ms: number): string {
+    const clamped = Math.max(0, ms);
+    if (clamped < 10_000) return `+${(clamped / 1000).toFixed(1)} с`;
+    const totalSec = Math.round(clamped / 1000);
+    if (totalSec < 60) return `+${totalSec} с`;
+    const min = Math.floor(totalSec / 60);
+    const rem = totalSec % 60;
+    return rem === 0 ? `+${min} мин` : `+${min} мин ${rem} с`;
+}
+
+function messageWithLag(item: AlertItem): string {
+    if (!Number.isFinite(item.postedAt)) return item.outMessage;
+    const lag = formatDeliveryLag(Date.now() - item.postedAt);
+    return `${item.outMessage}\n⏱ \`${lag}\``;
+}
+
 function sendOne(chatId: string, item: AlertItem, channelId: number): Promise<void> {
     const options = { parse_mode: 'MarkdownV2' as const };
-    const opts = { ...options, caption: item.outMessage };
 
     if (item.mediaUrl) {
         if (item.mediaType === 'photo') {
-            return sendWithRetry(() => bot.api.sendPhoto(chatId, item.mediaUrl!, opts), chatId, channelId);
+            return sendWithRetry(
+                () => bot.api.sendPhoto(chatId, item.mediaUrl!, { ...options, caption: messageWithLag(item) }),
+                chatId,
+                channelId
+            );
         }
         if (item.mediaType === 'video') {
-            return sendWithRetry(() => bot.api.sendVideo(chatId, item.mediaUrl!, opts), chatId, channelId);
+            return sendWithRetry(
+                () => bot.api.sendVideo(chatId, item.mediaUrl!, { ...options, caption: messageWithLag(item) }),
+                chatId,
+                channelId
+            );
         }
     }
-    return sendWithRetry(() => bot.api.sendMessage(chatId, item.outMessage, options), chatId, channelId);
+    return sendWithRetry(
+        () => bot.api.sendMessage(chatId, messageWithLag(item), options),
+        chatId,
+        channelId
+    );
 }
 
 function sendAlerts(payload: AlertsPayload): void {

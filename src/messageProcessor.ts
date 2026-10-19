@@ -13,8 +13,8 @@ export type IncomingMessage = {
 
 export function cleanMessage(text: string): string {
     return text
-        .replace(/📷TlkInst/gi, ' ')
-        .replace(/🎞Канал со стримами/gi, ' ')
+        .replace(/📷\s*TlkInst/gi, ' ')
+        .replace(/🎞\s*Канал со стримами/gi, ' ')
         .replace(/✅ Підпишись на СХІ[ДD]/gi, ' ')
         .replace(/[’ʼ]/g, "'")
         .replace(/[^\S\r\n]+/g, ' ')
@@ -166,6 +166,7 @@ export class MessageProcessor {
             mediaUrl?: string;
             mediaType?: 'photo' | 'video';
             telegramId: number;
+            postedAt: number;
         };
         const prepared: Prepared[] = [];
 
@@ -217,13 +218,19 @@ export class MessageProcessor {
                 outMessage,
                 mediaUrl: msg.mediaUrl,
                 mediaType: msg.mediaType,
-                telegramId: msg.telegramId
+                telegramId: msg.telegramId,
+                postedAt: msg.date.getTime()
             });
         }
 
         if (prepared.length > 0) {
             const subscriberIds = await this.getSubscriberIds(channelId);
-            if (subscriberIds.length > 0) {
+            if (subscriberIds.length === 0) {
+                logger.warn('Matched filter but no subscribers to notify', channelId, {
+                    matched: prepared.length,
+                    telegramIds: prepared.map(p => p.telegramId)
+                });
+            } else {
                 for (const p of prepared) {
                     this.markRecentlyEmitted(channelId, p.telegramId);
                 }
@@ -234,12 +241,15 @@ export class MessageProcessor {
                         outMessage: p.outMessage,
                         mediaUrl: p.mediaUrl,
                         mediaType: p.mediaType,
-                        telegramId: p.telegramId
+                        telegramId: p.telegramId,
+                        postedAt: p.postedAt
                     })),
                     subscriberIds
                 });
                 prepared.forEach(p =>
-                    logger.info(`🚨 Alert queued for ${p.telegramId}`, channelId)
+                    logger.info(`🚨 Alert queued for ${p.telegramId}`, channelId, {
+                        subscribers: subscriberIds.length
+                    })
                 );
             }
         }

@@ -5,6 +5,7 @@ export type AlertItem = {
     mediaUrl?: string;
     mediaType?: 'photo' | 'video';
     telegramId: number;
+    postedAt: number;
 };
 
 export type AlertsPayload = {
