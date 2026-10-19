@@ -11,6 +11,7 @@ model Channel {
   id              Int       @id @default(autoincrement())
   name            String?
   link            String    @unique
+  telegramPeerId  String?
   scrapTimeout    Int       @default(60000)
   addedAt       DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
