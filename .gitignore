@@ -1,6 +1,8 @@
 node_modules/
 dist/
 .env
+.mtproto-login.json
+mtproto-login-qr.png
 /src/generated/prisma
 *.db
 *.db-journal

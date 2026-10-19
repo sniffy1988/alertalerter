@@ -55,7 +55,8 @@ export class Scraper {
     private intervalSeconds: number;
     private pool: PoolEntry[] = [];
     private jobQueue: ScrapeJob[] = [];
-    private inFlight = new Set<number>();
+    private inFlightCount = new Map<number, number>();
+    private static readonly MAX_INFLIGHT_PER_CHANNEL = 2;
     private channelCache = new Map<number, CachedChannel>();
     private failureBackoffUntil = new Map<number, number>();
     private failureStreak = new Map<number, number>();
@@ -65,8 +66,9 @@ export class Scraper {
     private readonly poolSize: number;
     private static readonly MIN_SLEEP_MS = 50;
     private static readonly CACHE_REFRESH_MS = 15_000;
-    private static readonly FAILURE_BACKOFF_START_MS = 1_000;
-    private static readonly FAILURE_BACKOFF_CAP_MS = 30_000;
+    private static readonly MAX_SCRAPE_INTERVAL_MS = 500;
+    private static readonly FAILURE_BACKOFF_START_MS = 500;
+    private static readonly FAILURE_BACKOFF_CAP_MS = 5_000;
 
     constructor(
         intervalSeconds: number = 0.2,
@@ -106,6 +108,10 @@ export class Scraper {
             `Scraper ready (pool ${this.poolSize}, poll ${this.intervalSeconds * 1000}ms)`
         );
 
+        await prisma.channel.updateMany({
+            where: { scrapTimeout: { gt: Scraper.MAX_SCRAPE_INTERVAL_MS } },
+            data: { scrapTimeout: Scraper.MAX_SCRAPE_INTERVAL_MS }
+        });
         await this.refreshChannelCache();
 
         while (this.isRunning) {
@@ -163,7 +169,7 @@ export class Scraper {
 
         for (const channel of this.channelCache.values()) {
             const lastScrape = channel.lastScrapedAt ? new Date(channel.lastScrapedAt).getTime() : 0;
-            const remaining = channel.scrapTimeout - (now - lastScrape);
+            const remaining = this.scrapeIntervalMs(channel) - (now - lastScrape);
             if (remaining <= 0) return Scraper.MIN_SLEEP_MS;
             msUntilNextDue = Math.min(msUntilNextDue, remaining);
         }
@@ -183,7 +189,6 @@ export class Scraper {
         this.lastScrapeAt = now;
         const cached = this.channelCache.get(channelId);
         if (!cached) return;
-        cached.lastScrapedAt = new Date(now);
         if (maxTelegramId != null) {
             cached.lastSeenTelegramId = Math.max(cached.lastSeenTelegramId ?? 0, maxTelegramId);
         }
@@ -201,15 +206,37 @@ export class Scraper {
         this.failureBackoffUntil.set(channelId, Date.now() + backoffMs);
     }
 
-    private handleWorkerResult(entry: PoolEntry, result: WorkerResult) {
-        this.inFlight.delete(result.channelId);
-        entry.busy = false;
+    private inFlightOf(channelId: number): number {
+        return this.inFlightCount.get(channelId) ?? 0;
+    }
+
+    private beginInFlight(channelId: number): void {
+        this.inFlightCount.set(channelId, this.inFlightOf(channelId) + 1);
+    }
+
+    private endInFlight(channelId: number): void {
+        const next = this.inFlightOf(channelId) - 1;
+        if (next <= 0) this.inFlightCount.delete(channelId);
+        else this.inFlightCount.set(channelId, next);
+    }
+
+    private releaseWorkerJob(entry: PoolEntry, failed: boolean): void {
+        const job = entry.currentJob;
+        if (!job) return;
         entry.currentJob = undefined;
+        this.endInFlight(job.channelId);
+        if (failed) this.markScrapeFailure(job.channelId);
+    }
+
+    private handleWorkerResult(entry: PoolEntry, result: WorkerResult) {
+        this.releaseWorkerJob(entry, false);
+        entry.busy = false;
 
         if (result.success && result.messages) {
             this.markScrapeSuccess(result.channelId, result.maxTelegramId);
 
-            void this.processor.processIncomingMessages(result.channelId, result.messages)
+            const tagged = result.messages.map(message => ({ ...message, source: message.source || 't.me' }));
+            void this.processor.processIncomingMessages(result.channelId, tagged)
                 .then(({ persisted }) => {
                     if (persisted > 0) {
                         logger.info(`Scrape ingested ${persisted} new message(s)`, result.channelId, {
@@ -287,24 +314,16 @@ export class Scraper {
         worker.on('message', (result: WorkerResult) => this.handleWorkerResult(entry, result));
         worker.on('error', (err) => {
             logger.error('Worker crash', undefined, { error: err });
-            if (entry.currentJob) {
-                this.inFlight.delete(entry.currentJob.channelId);
-                this.markScrapeFailure(entry.currentJob.channelId);
-            }
+            this.releaseWorkerJob(entry, true);
             entry.busy = false;
-            entry.currentJob = undefined;
             this.removeFromPool(entry);
             this.replacePoolWorker();
             this.scheduleNextCycle();
         });
         worker.on('exit', (code) => {
             if (code !== 0) logger.warn(`Worker exited with code ${code}`);
-            if (entry.currentJob) {
-                this.inFlight.delete(entry.currentJob.channelId);
-                this.markScrapeFailure(entry.currentJob.channelId);
-            }
+            this.releaseWorkerJob(entry, true);
             entry.busy = false;
-            entry.currentJob = undefined;
             this.removeFromPool(entry);
             this.replacePoolWorker();
             this.scheduleNextCycle();
@@ -333,10 +352,16 @@ export class Scraper {
         const entry = this.getIdleWorker();
         if (!entry) return;
         const job = this.jobQueue.shift()!;
-        this.inFlight.add(job.channelId);
+        this.beginInFlight(job.channelId);
         entry.busy = true;
         entry.currentJob = job;
+        const cached = this.channelCache.get(job.channelId);
+        if (cached) cached.lastScrapedAt = new Date();
         entry.worker.postMessage(job);
+    }
+
+    private scrapeIntervalMs(channel: CachedChannel): number {
+        return Math.min(Math.max(channel.scrapTimeout, 200), Scraper.MAX_SCRAPE_INTERVAL_MS);
     }
 
     private async triggerScrapeCycle() {
@@ -349,10 +374,10 @@ export class Scraper {
 
             const lastScrape = channel.lastScrapedAt ? new Date(channel.lastScrapedAt).getTime() : 0;
             const elapsed = now - lastScrape;
+            const queued = this.jobQueue.filter(j => j.channelId === channel.id).length;
             if (
-                elapsed >= channel.scrapTimeout &&
-                !this.inFlight.has(channel.id) &&
-                !this.jobQueue.some(j => j.channelId === channel.id)
+                elapsed >= this.scrapeIntervalMs(channel) &&
+                this.inFlightOf(channel.id) + queued < Scraper.MAX_INFLIGHT_PER_CHANNEL
             ) {
                 this.jobQueue.push({
                     channelId: channel.id,

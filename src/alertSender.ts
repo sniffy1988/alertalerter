@@ -33,6 +33,28 @@ class Semaphore {
 }
 
 const sendSemaphore = new Semaphore(SEND_CONCURRENCY);
+const SENDS_PER_SECOND = 20;
+
+class SendPacer {
+    private nextAt = 0;
+    private blockedUntil = 0;
+
+    blockFor(ms: number): void {
+        const until = Date.now() + ms;
+        if (until > this.blockedUntil) this.blockedUntil = until;
+    }
+
+    async waitTurn(): Promise<void> {
+        const gap = 1000 / SENDS_PER_SECOND;
+        const now = Date.now();
+        const at = Math.max(now, this.nextAt, this.blockedUntil);
+        this.nextAt = at + gap;
+        const wait = at - now;
+        if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    }
+}
+
+const sendPacer = new SendPacer();
 
 function getRetryAfterMs(err: unknown): number | null {
     const e = err as { error_code?: number; parameters?: { retry_after?: number } };
@@ -47,27 +69,38 @@ async function sendWithRetry(
     chatId: string,
     channelId: number
 ): Promise<void> {
+    await sendPacer.waitTurn();
     await sendSemaphore.acquire();
+    let held = true;
     try {
         await sendFn();
-        return;
     } catch (err) {
         const retryAfter = getRetryAfterMs(err);
         if (retryAfter == null) {
             logger.error('Alert send failed', channelId, { chatId, error: err });
             return;
         }
+        sendPacer.blockFor(retryAfter);
         sendSemaphore.release();
+        held = false;
         await new Promise(r => setTimeout(r, retryAfter));
         await sendSemaphore.acquire();
+        held = true;
         try {
             await sendFn();
         } catch (retryErr) {
             logger.error('Alert send failed after retry', channelId, { chatId, error: retryErr });
         }
     } finally {
-        sendSemaphore.release();
+        if (held) sendSemaphore.release();
     }
+}
+
+function outgoingText(item: AlertItem): string {
+    if (!Number.isFinite(item.postedAt)) return item.outMessage;
+    const lagMs = Math.max(0, Date.now() - item.postedAt);
+    const label = item.source ? `${formatDeliveryLag(lagMs)} · ${item.source}` : formatDeliveryLag(lagMs);
+    return `${item.outMessage}\n⏱ \`${label}\``;
 }
 
 function formatDeliveryLag(ms: number): string {
@@ -80,36 +113,20 @@ function formatDeliveryLag(ms: number): string {
     return rem === 0 ? `+${min} мин` : `+${min} мин ${rem} с`;
 }
 
-function messageWithLag(item: AlertItem): string {
-    if (!Number.isFinite(item.postedAt)) return item.outMessage;
-    const lag = formatDeliveryLag(Date.now() - item.postedAt);
-    return `${item.outMessage}\n⏱ \`${lag}\``;
-}
-
 function sendOne(chatId: string, item: AlertItem, channelId: number): Promise<void> {
     const options = { parse_mode: 'MarkdownV2' as const };
+    const deliver = (send: (text: string) => Promise<unknown>) =>
+        sendWithRetry(() => send(outgoingText(item)), chatId, channelId);
 
     if (item.mediaUrl) {
         if (item.mediaType === 'photo') {
-            return sendWithRetry(
-                () => bot.api.sendPhoto(chatId, item.mediaUrl!, { ...options, caption: messageWithLag(item) }),
-                chatId,
-                channelId
-            );
+            return deliver(text => bot.api.sendPhoto(chatId, item.mediaUrl!, { ...options, caption: text }));
         }
         if (item.mediaType === 'video') {
-            return sendWithRetry(
-                () => bot.api.sendVideo(chatId, item.mediaUrl!, { ...options, caption: messageWithLag(item) }),
-                chatId,
-                channelId
-            );
+            return deliver(text => bot.api.sendVideo(chatId, item.mediaUrl!, { ...options, caption: text }));
         }
     }
-    return sendWithRetry(
-        () => bot.api.sendMessage(chatId, messageWithLag(item), options),
-        chatId,
-        channelId
-    );
+    return deliver(text => bot.api.sendMessage(chatId, text, options));
 }
 
 function sendAlerts(payload: AlertsPayload): void {

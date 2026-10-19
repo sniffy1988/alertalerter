@@ -4,9 +4,12 @@ import { bot, notifyAdminsBotAlive } from './bot';
 import { Scraper } from './scrapper';
 import { registerAlertSender } from './alertSender';
 import { MessageProcessor } from './messageProcessor';
+import { enableSqliteWal } from './db';
+import { startMtprotoIngest } from './mtprotoIngest';
 
 async function main() {
     console.log('Starting app...');
+    await enableSqliteWal();
 
     const processor = new MessageProcessor();
     const scraper = new Scraper(0.2, processor);
@@ -33,6 +36,7 @@ async function main() {
 
     registerAlertSender();
     void scraper.start();
+    void startMtprotoIngest(processor);
 }
 
 main().catch((err) => {

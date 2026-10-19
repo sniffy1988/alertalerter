@@ -9,6 +9,7 @@ export type IncomingMessage = {
     mediaType?: 'photo' | 'video';
     date: Date;
     sender?: string;
+    source?: string;
 };
 
 export function cleanMessage(text: string): string {
@@ -90,6 +91,22 @@ export class MessageProcessor {
         channelSet.set(telegramId.toString(), Date.now() + MessageProcessor.RECENTLY_EMITTED_TTL_MS);
     }
 
+    private claimIncoming(channelId: number, messages: IncomingMessage[]): IncomingMessage[] {
+        const claimed: IncomingMessage[] = [];
+        for (const msg of messages) {
+            if (this.isRecentlyEmitted(channelId, msg.telegramId)) continue;
+            this.markRecentlyEmitted(channelId, msg.telegramId);
+            claimed.push(msg);
+        }
+        return claimed;
+    }
+
+    private releaseClaim(channelId: number, messages: IncomingMessage[]): void {
+        const channelSet = this.recentlyEmitted.get(channelId);
+        if (!channelSet) return;
+        for (const msg of messages) channelSet.delete(msg.telegramId.toString());
+    }
+
     private async getChannel(channelId: number): Promise<CachedChannel | null> {
         const cached = this.channelCache.get(channelId);
         if (cached && cached.expiresAt > Date.now()) return cached;
@@ -131,22 +148,29 @@ export class MessageProcessor {
     ): Promise<{ processed: number; persisted: number }> {
         if (messages.length === 0) return { processed: 0, persisted: 0 };
 
+        const claimed = this.claimIncoming(channelId, messages);
+        if (claimed.length === 0) return { processed: messages.length, persisted: 0 };
+
+        let emitted = false;
+        try {
         await this.ensureRulesFresh();
 
-        const msgIds = messages.map(m => BigInt(m.telegramId));
-        const existingMessages = await prisma.message.findMany({
-            where: { channelId, telegramId: { in: msgIds } },
-            select: { telegramId: true }
-        });
+        const msgIds = claimed.map(m => BigInt(m.telegramId));
+        const [existingMessages, channel] = await Promise.all([
+            prisma.message.findMany({
+                where: { channelId, telegramId: { in: msgIds } },
+                select: { telegramId: true }
+            }),
+            this.getChannel(channelId)
+        ]);
         const existingIdsSet = new Set(existingMessages.map(m => m.telegramId.toString()));
 
-        const fresh = messages.filter(m =>
-            !existingIdsSet.has(m.telegramId.toString()) && !this.isRecentlyEmitted(channelId, m.telegramId)
-        );
+        const fresh = claimed.filter(m => !existingIdsSet.has(m.telegramId.toString()));
         if (fresh.length === 0) return { processed: messages.length, persisted: 0 };
-
-        const channel = await this.getChannel(channelId);
-        if (!channel) return { processed: 0, persisted: 0 };
+        if (!channel) {
+            this.releaseClaim(channelId, claimed);
+            return { processed: 0, persisted: 0 };
+        }
 
         const channelName = channel.name || channel.link || 'Alert';
         const escapedName = esc(channelName);
@@ -159,6 +183,8 @@ export class MessageProcessor {
             date: Date;
             channelId: number;
             sent: boolean;
+            deliveryLagMs?: number;
+            ingestSource?: string;
         };
         const allMessagesToPersist: MessageRow[] = [];
         type Prepared = {
@@ -167,10 +193,12 @@ export class MessageProcessor {
             mediaType?: 'photo' | 'video';
             telegramId: number;
             postedAt: number;
+            source: string;
         };
         const prepared: Prepared[] = [];
 
         for (const msg of fresh) {
+            const source = msg.source || 't.me';
             const cleanedText = cleanMessage(msg.text);
             const normalizedText = normalize(cleanedText);
             const passedFilter =
@@ -182,6 +210,7 @@ export class MessageProcessor {
                     telegramId: msg.telegramId,
                     preview: previewMessageText(cleanedText),
                     matchedFilter: true,
+                    source,
                     hasMedia: !!(msg.mediaUrl || msg.mediaType)
                 });
             } else {
@@ -189,6 +218,7 @@ export class MessageProcessor {
                     telegramId: msg.telegramId,
                     preview: previewMessageText(cleanedText),
                     matchedFilter: false,
+                    source,
                     hasMedia: !!(msg.mediaUrl || msg.mediaType)
                 });
             }
@@ -200,7 +230,8 @@ export class MessageProcessor {
                 mediaType: msg.mediaType,
                 date: msg.date,
                 channelId,
-                sent: passedFilter
+                sent: passedFilter,
+                ingestSource: source
             });
 
             if (!passedFilter) continue;
@@ -219,7 +250,8 @@ export class MessageProcessor {
                 mediaUrl: msg.mediaUrl,
                 mediaType: msg.mediaType,
                 telegramId: msg.telegramId,
-                postedAt: msg.date.getTime()
+                postedAt: msg.date.getTime(),
+                source
             });
         }
 
@@ -231,9 +263,13 @@ export class MessageProcessor {
                     telegramIds: prepared.map(p => p.telegramId)
                 });
             } else {
-                for (const p of prepared) {
-                    this.markRecentlyEmitted(channelId, p.telegramId);
+                const queuedAt = Date.now();
+                const lagById = new Map(prepared.map(p => [p.telegramId.toString(), Math.max(0, queuedAt - p.postedAt)]));
+                for (const row of allMessagesToPersist) {
+                    const lag = lagById.get(row.telegramId.toString());
+                    if (lag != null) row.deliveryLagMs = lag;
                 }
+                emitted = true;
                 emitAlerts({
                     channelId,
                     channelName,
@@ -242,13 +278,15 @@ export class MessageProcessor {
                         mediaUrl: p.mediaUrl,
                         mediaType: p.mediaType,
                         telegramId: p.telegramId,
-                        postedAt: p.postedAt
+                        postedAt: p.postedAt,
+                        source: p.source
                     })),
                     subscriberIds
                 });
                 prepared.forEach(p =>
                     logger.info(`🚨 Alert queued for ${p.telegramId}`, channelId, {
-                        subscribers: subscriberIds.length
+                        subscribers: subscriberIds.length,
+                        source: p.source
                     })
                 );
             }
@@ -273,6 +311,8 @@ export class MessageProcessor {
                                 mediaType: m.mediaType,
                                 date: m.date,
                                 sent: m.sent,
+                                deliveryLagMs: m.deliveryLagMs,
+                                ingestSource: m.ingestSource,
                                 channelId: m.channelId
                             },
                             update: {}
@@ -289,5 +329,9 @@ export class MessageProcessor {
         }
 
         return { processed: messages.length, persisted: 0 };
+        } catch (e) {
+            if (!emitted) this.releaseClaim(channelId, claimed);
+            throw e;
+        }
     }
 }

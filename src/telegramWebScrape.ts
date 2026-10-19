@@ -6,7 +6,7 @@ import { isMainThread, workerData } from 'worker_threads';
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
 
 const axiosInstance = axios.create({
-    timeout: 5000,
+    timeout: 2500,
     headers: { 'User-Agent': USER_AGENT },
     httpAgent: new http.Agent({ keepAlive: true }),
     httpsAgent: new https.Agent({ keepAlive: true })
@@ -58,7 +58,7 @@ function formatFetchError(err: unknown): string {
     return String(err);
 }
 
-async function fetchWithRetry(url: string, maxAttempts = 3): Promise<string> {
+async function fetchWithRetry(url: string, maxAttempts = 2): Promise<string> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {

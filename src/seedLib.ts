@@ -1,9 +1,9 @@
 import { PrismaClient } from '@prisma/client';
 
 export const SEED_CHANNELS = [
-    { link: 'tlknewsua', name: 'TLK', scrapTimeout: 1000 },
-    { link: 'monitor1654', name: 'Монитор 1654', scrapTimeout: 1000 },
-    { link: 'cxidua', name: 'CXID UA', scrapTimeout: 3000 }
+    { link: 'tlknewsua', name: 'TLK', scrapTimeout: 500 },
+    { link: 'monitor1654', name: 'Монитор 1654', scrapTimeout: 500 },
+    { link: 'cxidua', name: 'CXID UA', scrapTimeout: 500 }
 ];
 
 export const SEED_FILTER_PHRASES = [
