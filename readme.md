@@ -65,6 +65,8 @@ services:
       - DATABASE_URL=file:/database/alerts.db
       - TELEGRAM_BOT_TOKEN=your_bot_token_here
       - SCRAPER_POOL_SIZE=4
+      - MTPROTO_POLL_CONCURRENCY=8
+      - MTPROTO_POLL_INTERVAL_MS=400
       - ALERT_SEND_CONCURRENCY=8
     volumes:
       # Change './db_data' to any absolute path on your host (e.g. /mnt/data/mybot)
