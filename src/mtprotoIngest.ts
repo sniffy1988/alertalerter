@@ -1,7 +1,7 @@
 import fs from 'fs';
 import { TelegramClient, utils } from 'telegram';
 import { StringSession } from 'telegram/sessions';
-import { Raw } from 'telegram/events';
+import { NewMessage, NewMessageEvent, Raw } from 'telegram/events';
 import { Api } from 'telegram/tl';
 import prisma from './db';
 import { logger } from './logger';
@@ -21,6 +21,10 @@ const OUTDATED_BACKOFF_CAP_MS = 5_000;
 const OUTDATED_FORCE_MIN_STREAK = 3;
 const NO_DIFF_RESYNC_MS = 30_000;
 const LIVE_PUSH_POLL_GUARD_MS = 1_000;
+const SUBSCRIBE_WARM_HISTORY_LIMIT = 20;
+const WARM_HISTORY_INTERVAL_MS = 45_000;
+const WARM_HISTORY_LIMIT = 10;
+const WARM_HISTORY_TICK_MS = 15_000;
 
 type IngestMode = 'live' | 'historical';
 
@@ -157,6 +161,9 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
     const outdatedStreak = new Map<number, number>();
     const lastSuccessfulDiffAt = new Map<number, number>();
     const groupedSeen = new Set<string>();
+    const warmInFlight = new Set<number>();
+    const lastLiveIngestAt = new Map<number, number>();
+    const liveDeliveryDedupe = new Map<string, number>();
     let globalPollPausedUntil = 0;
     let running = true;
 
@@ -182,6 +189,20 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         void processor.processIncomingMessages(channelId, messages).catch(error => {
             logger.error('MTProto processIncomingMessages failed', channelId, { error });
         });
+    };
+
+    const shouldSkipLiveDuplicate = (channelId: number, telegramId: number): boolean => {
+        const key = `${channelId}:${telegramId}`;
+        const expiresAt = liveDeliveryDedupe.get(key);
+        const now = Date.now();
+        if (expiresAt != null && expiresAt > now) return true;
+        liveDeliveryDedupe.set(key, now + 60_000);
+        if (liveDeliveryDedupe.size > 5000) {
+            for (const [k, exp] of liveDeliveryDedupe) {
+                if (exp <= now) liveDeliveryDedupe.delete(k);
+            }
+        }
+        return false;
     };
 
     const ingest = (msg: Api.Message, mapping: ChannelMapping, mode: IngestMode) => {
@@ -239,12 +260,21 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
             return;
         }
 
+        if (mode === 'live' && shouldSkipLiveDuplicate(mapping.channelId, msg.id)) {
+            logger.debug('MTProto skip message', mapping.channelId, {
+                reason: 'live_duplicate',
+                telegramId: msg.id
+            });
+            return;
+        }
+
         logger.info('MTProto push received', mapping.channelId, {
             username: mapping.username,
             telegramId: msg.id,
             preview: previewMessageText(text),
             mode
         });
+        if (mode === 'live') lastLiveIngestAt.set(mapping.channelId, Date.now());
         scheduleProcessor(mapping.channelId, [
             {
                 telegramId: msg.id,
@@ -255,19 +285,59 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         ]);
     };
 
-    const ingestFromMessage = (msg: Api.Message, mode: IngestMode) => {
-        if (!msg.peerId) return;
-        const peerId = utils.getPeerId(msg.peerId).toString();
-        const mapping = peerToChannel.get(peerId);
+    const ingestFromMessage = (msg: Api.Message, mode: IngestMode, channelId?: number) => {
+        let mapping: ChannelMapping | undefined;
+        if (msg.peerId) {
+            const peerId = utils.getPeerId(msg.peerId).toString();
+            mapping = peerToChannel.get(peerId);
+        }
+        if (!mapping && channelId != null) mapping = channelMappings.get(channelId);
         if (!mapping) {
-            logger.debug('MTProto skip message', undefined, {
+            logger.debug('MTProto skip message', channelId, {
                 reason: 'unknown_peer',
-                telegramId: msg.id,
-                peerId
+                telegramId: msg.id
             });
             return;
         }
         ingest(msg, mapping, mode);
+    };
+
+    const handleLiveChannelUpdate = (msg: Api.Message, pts?: number) => {
+        if (!msg.peerId) return;
+        const peerId = utils.getPeerId(msg.peerId).toString();
+        const mapping = peerToChannel.get(peerId);
+        if (!mapping) return;
+        if (pts != null) setChannelPts(mapping.channelId, pts);
+        bumpPollAfterLivePush(mapping.channelId);
+        ingest(msg, mapping, 'live');
+    };
+
+    const warmChannelHistory = async (
+        channelId: number,
+        entity: Api.Channel,
+        mapping: ChannelMapping,
+        limit = WARM_HISTORY_LIMIT
+    ) => {
+        const history = await client.invoke(
+            new Api.messages.GetHistory({
+                peer: entity,
+                limit
+            })
+        );
+        const messages = 'messages' in history ? history.messages : [];
+        let ingested = 0;
+        for (const message of messages) {
+            if (message instanceof Api.Message) {
+                ingest(message, mapping, 'live');
+                ingested++;
+            }
+        }
+        if (ingested > 0) {
+            logger.debug('MTProto warm history', channelId, {
+                username: mapping.username,
+                fetched: ingested
+            });
+        }
     };
 
     const markDifferenceSuccess = (channelId: number) => {
@@ -297,7 +367,7 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
                 });
             }
             for (const message of messages) {
-                if (message instanceof Api.Message) ingestFromMessage(message, mode);
+                if (message instanceof Api.Message) ingestFromMessage(message, mode, channelId);
             }
             return pollDelayAfterDifference(diff, pollIntervalMs);
         }
@@ -307,7 +377,7 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
             markDifferenceSuccess(channelId);
             logger.info('MTProto channel difference too long', channelId, { messages: diff.messages?.length ?? 0 });
             for (const message of diff.messages ?? []) {
-                if (message instanceof Api.Message) ingestFromMessage(message, mode);
+                if (message instanceof Api.Message) ingestFromMessage(message, mode, channelId);
             }
         }
         return pollIntervalMs;
@@ -410,6 +480,20 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         channelNextPollAt.set(channel.id, Date.now() + delayMs);
         lastSuccessfulDiffAt.set(channel.id, Date.now());
 
+        try {
+            await warmChannelHistory(
+                channel.id,
+                entity,
+                { channelId: channel.id, username, peerId },
+                SUBSCRIBE_WARM_HISTORY_LIMIT
+            );
+        } catch (error) {
+            logger.warn('MTProto subscribe warm history failed', channel.id, {
+                username,
+                error: error instanceof Error ? error.message : String(error)
+            });
+        }
+
         logger.info('MTProto channel pts subscribed', channel.id, {
             username,
             pts: channelPts.get(channel.id),
@@ -440,18 +524,25 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         try {
             for (const channelUpdate of channelUpdates) {
                 if (!(channelUpdate.message instanceof Api.Message) || !channelUpdate.message.peerId) continue;
-                const peerId = utils.getPeerId(channelUpdate.message.peerId).toString();
-                const mapping = peerToChannel.get(peerId);
-                if (mapping) {
-                    setChannelPts(mapping.channelId, channelUpdate.pts);
-                    bumpPollAfterLivePush(mapping.channelId);
-                    ingest(channelUpdate.message, mapping, 'live');
-                }
+                handleLiveChannelUpdate(channelUpdate.message, channelUpdate.pts);
             }
         } catch (error) {
             logger.error('MTProto raw update failed', undefined, { error });
         }
     }, new Raw({}));
+
+    client.addEventHandler(async (event: NewMessageEvent) => {
+        try {
+            const msg = event.message;
+            if (!(msg instanceof Api.Message) || !msg.peerId) return;
+            const update = event.originalUpdate;
+            const pts =
+                update instanceof Api.UpdateNewChannelMessage ? update.pts : undefined;
+            handleLiveChannelUpdate(msg, pts);
+        } catch (error) {
+            logger.error('MTProto new message handler failed', undefined, { error });
+        }
+    }, new NewMessage({ incoming: true }));
 
     await syncChannels();
     logger.info('MTProto channel difference poll started', undefined, {
@@ -471,7 +562,7 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         );
         const messages = 'messages' in history ? history.messages : [];
         for (const message of messages) {
-            if (message instanceof Api.Message) ingestFromMessage(message, 'historical');
+            if (message instanceof Api.Message) ingestFromMessage(message, 'historical', channelId);
         }
         if (freshPts != null) setChannelPts(channelId, freshPts);
         lastSuccessfulDiffAt.set(channelId, Date.now());
@@ -610,6 +701,27 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         }
     };
     void poll();
+
+    setInterval(() => {
+        if (!running) return;
+        const now = Date.now();
+        for (const mapping of channelMappings.values()) {
+            const entity = channelEntities.get(mapping.channelId);
+            if (!entity) continue;
+            const lastLive = lastLiveIngestAt.get(mapping.channelId) ?? 0;
+            if (now - lastLive < WARM_HISTORY_INTERVAL_MS) continue;
+            if (warmInFlight.has(mapping.channelId)) continue;
+            warmInFlight.add(mapping.channelId);
+            void warmChannelHistory(mapping.channelId, entity, mapping)
+                .catch(error => {
+                    logger.debug('MTProto warm history failed', mapping.channelId, {
+                        username: mapping.username,
+                        error: error instanceof Error ? error.message : String(error)
+                    });
+                })
+                .finally(() => warmInFlight.delete(mapping.channelId));
+        }
+    }, WARM_HISTORY_TICK_MS);
 
     setInterval(() => {
         void client.invoke(new Api.updates.GetState()).catch(error => {
