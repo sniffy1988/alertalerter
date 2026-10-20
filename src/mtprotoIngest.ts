@@ -6,6 +6,7 @@ import { Api } from 'telegram/tl';
 import prisma from './db';
 import { logger } from './logger';
 import { MessageProcessor, previewMessageText } from './messageProcessor';
+import { markMtprotoLive, mtprotoLastLiveAt } from './mtprotoActivity';
 import { peerIdAliases, resolvePeerIdFromEntity } from './telegramPeerId';
 
 const MAX_HISTORICAL_POST_AGE_MS = 120_000;
@@ -22,9 +23,19 @@ const OUTDATED_FORCE_MIN_STREAK = 3;
 const NO_DIFF_RESYNC_MS = 30_000;
 const LIVE_PUSH_POLL_GUARD_MS = 1_000;
 const SUBSCRIBE_WARM_HISTORY_LIMIT = 20;
-const WARM_HISTORY_INTERVAL_MS = 45_000;
 const WARM_HISTORY_LIMIT = 10;
-const WARM_HISTORY_TICK_MS = 15_000;
+
+function parseWarmIntervalMs(): number {
+    const n = Number(process.env.MTPROTO_WARM_INTERVAL_MS);
+    if (Number.isFinite(n) && n >= 5_000) return Math.min(120_000, Math.floor(n));
+    return 12_000;
+}
+
+function parseWarmTickMs(): number {
+    const n = Number(process.env.MTPROTO_WARM_TICK_MS);
+    if (Number.isFinite(n) && n >= 2_000) return Math.min(30_000, Math.floor(n));
+    return 5_000;
+}
 
 type IngestMode = 'live' | 'historical';
 
@@ -132,6 +143,8 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
 
     const pollConcurrency = parsePollConcurrency();
     const pollIntervalMs = parsePollIntervalMs();
+    const warmIntervalMs = parseWarmIntervalMs();
+    const warmTickMs = parseWarmTickMs();
 
     const client = new TelegramClient(new StringSession(session), apiId, apiHash, {
         connectionRetries: 5,
@@ -162,7 +175,6 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
     const lastSuccessfulDiffAt = new Map<number, number>();
     const groupedSeen = new Set<string>();
     const warmInFlight = new Set<number>();
-    const lastLiveIngestAt = new Map<number, number>();
     const liveDeliveryDedupe = new Map<string, number>();
     let globalPollPausedUntil = 0;
     let running = true;
@@ -274,7 +286,7 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
             preview: previewMessageText(text),
             mode
         });
-        if (mode === 'live') lastLiveIngestAt.set(mapping.channelId, Date.now());
+        if (mode === 'live') markMtprotoLive(mapping.channelId);
         scheduleProcessor(mapping.channelId, [
             {
                 telegramId: msg.id,
@@ -708,8 +720,8 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         for (const mapping of channelMappings.values()) {
             const entity = channelEntities.get(mapping.channelId);
             if (!entity) continue;
-            const lastLive = lastLiveIngestAt.get(mapping.channelId) ?? 0;
-            if (now - lastLive < WARM_HISTORY_INTERVAL_MS) continue;
+            const lastLive = mtprotoLastLiveAt(mapping.channelId) ?? 0;
+            if (now - lastLive < warmIntervalMs) continue;
             if (warmInFlight.has(mapping.channelId)) continue;
             warmInFlight.add(mapping.channelId);
             void warmChannelHistory(mapping.channelId, entity, mapping)
@@ -721,7 +733,7 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
                 })
                 .finally(() => warmInFlight.delete(mapping.channelId));
         }
-    }, WARM_HISTORY_TICK_MS);
+    }, warmTickMs);
 
     setInterval(() => {
         void client.invoke(new Api.updates.GetState()).catch(error => {

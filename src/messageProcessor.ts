@@ -293,39 +293,38 @@ export class MessageProcessor {
         }
 
         if (allMessagesToPersist.length > 0) {
-            try {
-                // SQLite does not support createMany skipDuplicates — upserts stay.
-                const results = await Promise.all(
-                    allMessagesToPersist.map(m =>
-                        prisma.message.upsert({
-                            where: {
-                                telegramId_channelId: {
-                                    telegramId: m.telegramId,
-                                    channelId: m.channelId
-                                }
-                            },
-                            create: {
+            const rows = allMessagesToPersist;
+            void Promise.all(
+                rows.map(m =>
+                    prisma.message.upsert({
+                        where: {
+                            telegramId_channelId: {
                                 telegramId: m.telegramId,
-                                message: m.message,
-                                mediaUrl: m.mediaUrl,
-                                mediaType: m.mediaType,
-                                date: m.date,
-                                sent: m.sent,
-                                deliveryLagMs: m.deliveryLagMs,
-                                ingestSource: m.ingestSource,
                                 channelId: m.channelId
-                            },
-                            update: {}
-                        })
-                    )
-                );
-                logger.info(`Persisted ${results.length} message(s)`, channelId, {
-                    attempted: allMessagesToPersist.length
-                });
-                return { processed: messages.length, persisted: results.length };
-            } catch (e) {
-                logger.error('Failed to persist messages', channelId, { error: e });
-            }
+                            }
+                        },
+                        create: {
+                            telegramId: m.telegramId,
+                            message: m.message,
+                            mediaUrl: m.mediaUrl,
+                            mediaType: m.mediaType,
+                            date: m.date,
+                            sent: m.sent,
+                            deliveryLagMs: m.deliveryLagMs,
+                            ingestSource: m.ingestSource,
+                            channelId: m.channelId
+                        },
+                        update: {}
+                    })
+                )
+            )
+                .then(results => {
+                    logger.info(`Persisted ${results.length} message(s)`, channelId, {
+                        attempted: rows.length
+                    });
+                })
+                .catch(e => logger.error('Failed to persist messages', channelId, { error: e }));
+            return { processed: messages.length, persisted: rows.length };
         }
 
         return { processed: messages.length, persisted: 0 };
