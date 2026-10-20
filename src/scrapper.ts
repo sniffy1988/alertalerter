@@ -3,7 +3,6 @@ import { Worker } from 'worker_threads';
 import prisma from './db';
 import { logger } from './logger';
 import { MessageProcessor, type IncomingMessage } from './messageProcessor';
-import { mtprotoRecentlyLive, parseScrapeBackoffMs } from './mtprotoActivity';
 import { getPreferredHost, probeTelegramWebScrape } from './telegramWebScrape';
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -379,11 +378,7 @@ export class Scraper {
     private scrapeIntervalMs(channel: CachedChannel): number {
         const cap = Scraper.MAX_SCRAPE_INTERVAL_MS;
         const floor = Math.min(50, cap);
-        const base = Math.min(Math.max(channel.scrapTimeout, floor), cap);
-        if (mtprotoRecentlyLive(channel.id)) {
-            return Math.max(base, parseScrapeBackoffMs());
-        }
-        return base;
+        return Math.min(Math.max(channel.scrapTimeout, floor), cap);
     }
 
     private async triggerScrapeCycle() {
@@ -412,12 +407,7 @@ export class Scraper {
             }
         }
 
-        dueJobs.sort((a, b) => {
-            const aBackedOff = mtprotoRecentlyLive(a.channelId) ? 1 : 0;
-            const bBackedOff = mtprotoRecentlyLive(b.channelId) ? 1 : 0;
-            if (aBackedOff !== bBackedOff) return aBackedOff - bBackedOff;
-            return (b.overdueMs ?? 0) - (a.overdueMs ?? 0);
-        });
+        dueJobs.sort((a, b) => (b.overdueMs ?? 0) - (a.overdueMs ?? 0));
         for (const { overdueMs: _overdue, ...job } of dueJobs) {
             this.jobQueue.push(job);
         }
