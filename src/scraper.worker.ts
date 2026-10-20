@@ -25,9 +25,12 @@ interface WorkerResult {
     username: string;
     messages?: ScrapedMessage[];
     maxTelegramId?: number;
+    hasMore?: boolean;
     error?: any;
     log?: string;
 }
+
+const PAGE_SIZE = 20;
 
 function parseMessageId($: CheerioRoot, element: any): number | null {
     const dataId = $(element).find('.tgme_widget_message').attr('data-post');
@@ -107,8 +110,11 @@ function extractMessageIdsFromHtml(html: string): number[] {
     return ids;
 }
 
-async function scrapeChannel(username: string, afterTelegramId?: number): Promise<{ messages: ScrapedMessage[]; maxTelegramId?: number }> {
-    const html = await fetchChannelHtml(username);
+async function scrapeChannel(username: string, afterTelegramId?: number): Promise<{ messages: ScrapedMessage[]; maxTelegramId?: number; hasMore?: boolean }> {
+    const html = await fetchChannelHtml(username, afterTelegramId);
+    if (!html.trim()) {
+        return { messages: [], maxTelegramId: afterTelegramId };
+    }
     const quickIds = extractMessageIdsFromHtml(html);
     if (quickIds.length > 0) {
         const maxId = Math.max(...quickIds);
@@ -139,22 +145,25 @@ async function scrapeChannel(username: string, afterTelegramId?: number): Promis
         if (parsed) messages.push(parsed);
     }
 
+    const pageMax = quickIds.length > 0 ? Math.max(...quickIds) : maxTelegramId;
     return {
         messages,
-        maxTelegramId: maxTelegramId > 0 ? maxTelegramId : undefined
+        maxTelegramId: maxTelegramId > 0 ? maxTelegramId : undefined,
+        hasMore: afterTelegramId != null && quickIds.length >= PAGE_SIZE && pageMax > afterTelegramId
     };
 }
 
 if (parentPort) {
     parentPort.on('message', async (job: WorkerJob) => {
         try {
-            const { messages, maxTelegramId } = await scrapeChannel(job.username, job.afterTelegramId);
+            const { messages, maxTelegramId, hasMore } = await scrapeChannel(job.username, job.afterTelegramId);
             const result: WorkerResult = {
                 success: true,
                 channelId: job.channelId,
                 username: job.username,
                 messages,
-                maxTelegramId
+                maxTelegramId,
+                hasMore
             };
             parentPort?.postMessage(result);
         } catch (error) {

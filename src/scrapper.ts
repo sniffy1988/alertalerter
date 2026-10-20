@@ -14,12 +14,19 @@ function parsePoolSize(): number {
     return 4;
 }
 
+function parseMaxScrapeIntervalMs(): number {
+    const n = Number(process.env.SCRAPER_MAX_INTERVAL_MS);
+    if (Number.isFinite(n) && n >= 50) return Math.min(5_000, Math.floor(n));
+    return 100;
+}
+
 interface WorkerResult {
     success: boolean;
     channelId: number;
     username: string;
     messages?: IncomingMessage[];
     maxTelegramId?: number;
+    hasMore?: boolean;
     error?: any;
     log?: string;
 }
@@ -68,7 +75,7 @@ export class Scraper {
     private readonly poolSize: number;
     private static readonly MIN_SLEEP_MS = 50;
     private static readonly CACHE_REFRESH_MS = 15_000;
-    private static readonly MAX_SCRAPE_INTERVAL_MS = 300;
+    private static readonly MAX_SCRAPE_INTERVAL_MS = parseMaxScrapeIntervalMs();
     private static readonly FAILURE_BACKOFF_START_MS = 500;
     private static readonly FAILURE_BACKOFF_CAP_MS = 5_000;
 
@@ -236,6 +243,13 @@ export class Scraper {
 
         if (result.success && result.messages) {
             this.markScrapeSuccess(result.channelId, result.maxTelegramId);
+            if (result.hasMore && result.maxTelegramId != null) {
+                this.jobQueue.push({
+                    channelId: result.channelId,
+                    username: result.username,
+                    afterTelegramId: result.maxTelegramId
+                });
+            }
 
             const tagged = result.messages.map(message => ({ ...message, source: message.source || 't.me' }));
             void this.processor.processIncomingMessages(result.channelId, tagged)
@@ -363,7 +377,9 @@ export class Scraper {
     }
 
     private scrapeIntervalMs(channel: CachedChannel): number {
-        const base = Math.min(Math.max(channel.scrapTimeout, 200), Scraper.MAX_SCRAPE_INTERVAL_MS);
+        const cap = Scraper.MAX_SCRAPE_INTERVAL_MS;
+        const floor = Math.min(50, cap);
+        const base = Math.min(Math.max(channel.scrapTimeout, floor), cap);
         if (mtprotoRecentlyLive(channel.id)) {
             return Math.max(base, parseScrapeBackoffMs());
         }
