@@ -1,7 +1,7 @@
 import fs from 'fs';
 import { TelegramClient, utils } from 'telegram';
 import { StringSession } from 'telegram/sessions';
-import { NewMessage, Raw, type NewMessageEvent } from 'telegram/events';
+import { Raw } from 'telegram/events';
 import { Api } from 'telegram/tl';
 import prisma from './db';
 import { logger } from './logger';
@@ -9,9 +9,37 @@ import { MessageProcessor, previewMessageText } from './messageProcessor';
 import { peerIdAliases, resolvePeerIdFromEntity } from './telegramPeerId';
 
 const MAX_POST_AGE_MS = 120_000;
-const POLL_GAP_MS = 1_000;
 const KEEP_ALIVE_MS = 30_000;
 const CHANNEL_REFRESH_MS = 30_000;
+const RESYNC_COOLDOWN_MS = 15_000;
+const RESYNC_HISTORY_LIMIT = 30;
+const HOT_DIFFERENCE_LIMIT = 10;
+const SUBSCRIBE_DIFFERENCE_LIMIT = 100;
+const POLL_TICK_MS = 50;
+
+function parsePollConcurrency(): number {
+    const n = Number(process.env.MTPROTO_POLL_CONCURRENCY);
+    if (Number.isFinite(n) && n >= 1) return Math.min(32, Math.floor(n));
+    return 8;
+}
+
+function parsePollIntervalMs(): number {
+    const n = Number(process.env.MTPROTO_POLL_INTERVAL_MS);
+    if (Number.isFinite(n) && n >= 100) return Math.min(10_000, Math.floor(n));
+    return 400;
+}
+
+function isPtsOutdated(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /PERSISTENT_TIMESTAMP_OUTDATED/i.test(message);
+}
+
+function parseFloodWaitSeconds(error: unknown): number | null {
+    const message = error instanceof Error ? error.message : String(error);
+    const match = message.match(/FLOOD_WAIT[_\s](\d+)/i);
+    if (match) return Number(match[1]);
+    return null;
+}
 
 type ChannelMapping = { channelId: number; username: string; peerId: string };
 
@@ -37,6 +65,23 @@ function channelUsername(link: string): string | null {
     return /^[A-Za-z0-9_]+$/.test(trimmed) ? trimmed : null;
 }
 
+async function runWithConcurrency<T>(
+    items: T[],
+    limit: number,
+    fn: (item: T) => Promise<void>
+): Promise<void> {
+    if (items.length === 0) return;
+    let index = 0;
+    const workerCount = Math.min(limit, items.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+        while (index < items.length) {
+            const i = index++;
+            await fn(items[i]);
+        }
+    });
+    await Promise.all(workers);
+}
+
 export async function startMtprotoIngest(processor: MessageProcessor): Promise<void> {
     const apiId = Number(process.env.TELEGRAM_API_ID);
     const apiHash = process.env.TELEGRAM_API_HASH?.trim();
@@ -45,6 +90,9 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         logger.info('MTProto ingest off (no api id, hash, or user session)');
         return;
     }
+
+    const pollConcurrency = parsePollConcurrency();
+    const pollIntervalMs = parsePollIntervalMs();
 
     const client = new TelegramClient(new StringSession(session), apiId, apiHash, {
         connectionRetries: 5,
@@ -67,7 +115,11 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
     const channelMappings = new Map<number, ChannelMapping>();
     const channelPts = new Map<number, number>();
     const channelEntities = new Map<number, Api.Channel>();
+    const channelNextPollAt = new Map<number, number>();
+    const pollInFlight = new Set<number>();
+    const resyncNotBefore = new Map<number, number>();
     const groupedSeen = new Set<string>();
+    let globalPollPausedUntil = 0;
     let running = true;
 
     const remember = (mapping: ChannelMapping) => {
@@ -77,7 +129,13 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         }
     };
 
-    const ingest = async (msg: Api.Message) => {
+    const scheduleProcessor = (channelId: number, messages: Parameters<MessageProcessor['processIncomingMessages']>[1]) => {
+        void processor.processIncomingMessages(channelId, messages).catch(error => {
+            logger.error('MTProto processIncomingMessages failed', channelId, { error });
+        });
+    };
+
+    const ingest = (msg: Api.Message) => {
         if (!msg.peerId || msg.editDate) return;
         const peerId = utils.getPeerId(msg.peerId).toString();
         const mapping = peerToChannel.get(peerId);
@@ -101,7 +159,7 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
             telegramId: msg.id,
             preview: previewMessageText(text)
         });
-        await processor.processIncomingMessages(mapping.channelId, [
+        scheduleProcessor(mapping.channelId, [
             {
                 telegramId: msg.id,
                 text,
@@ -111,7 +169,7 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         ]);
     };
 
-    const applyDifference = async (channelId: number, diff: Api.updates.TypeChannelDifference) => {
+    const applyDifference = (channelId: number, diff: Api.updates.TypeChannelDifference) => {
         if (diff instanceof Api.updates.ChannelDifferenceEmpty) {
             channelPts.set(channelId, Number(diff.pts));
             return;
@@ -120,10 +178,13 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
             channelPts.set(channelId, Number(diff.pts));
             const messages = diff.newMessages ?? [];
             if (messages.length > 0) {
-                logger.info('MTProto channel difference', channelId, { newMessages: messages.length, pts: Number(diff.pts) });
+                logger.info('MTProto channel difference', channelId, {
+                    newMessages: messages.length,
+                    pts: Number(diff.pts)
+                });
             }
             for (const message of messages) {
-                if (message instanceof Api.Message) await ingest(message);
+                if (message instanceof Api.Message) ingest(message);
             }
             return;
         }
@@ -132,8 +193,29 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
             if (dialogPts != null) channelPts.set(channelId, dialogPts);
             logger.info('MTProto channel difference too long', channelId, { messages: diff.messages?.length ?? 0 });
             for (const message of diff.messages ?? []) {
-                if (message instanceof Api.Message) await ingest(message);
+                if (message instanceof Api.Message) ingest(message);
             }
+        }
+    };
+
+    const fetchDifference = (entity: Api.Channel, pts: number, limit: number, force: boolean) =>
+        client.invoke(
+            new Api.updates.GetChannelDifference({
+                channel: entity,
+                filter: new Api.ChannelMessagesFilterEmpty(),
+                pts,
+                limit,
+                ...(force ? { force: true } : {})
+            })
+        );
+
+    const noteFloodWait = (error: unknown) => {
+        const waitSec = parseFloodWaitSeconds(error);
+        if (waitSec == null) return;
+        const until = Date.now() + waitSec * 1000;
+        if (until > globalPollPausedUntil) {
+            globalPollPausedUntil = until;
+            logger.warn('MTProto poll paused for flood wait', undefined, { waitSec });
         }
     };
 
@@ -161,18 +243,11 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
 
         const full = await client.invoke(new Api.channels.GetFullChannel({ channel: entity }));
         const pts = 'pts' in full.fullChat ? Number(full.fullChat.pts) : 1;
-        const diff = await client.invoke(
-            new Api.updates.GetChannelDifference({
-                channel: entity,
-                filter: new Api.ChannelMessagesFilterEmpty(),
-                pts,
-                limit: 100,
-                force: true
-            })
-        );
+        const diff = await fetchDifference(entity, pts, SUBSCRIBE_DIFFERENCE_LIMIT, true);
         channelEntities.set(channel.id, entity);
         channelPts.set(channel.id, 'pts' in diff ? Number(diff.pts) : pts);
-        await applyDifference(channel.id, diff);
+        channelNextPollAt.set(channel.id, 0);
+        applyDifference(channel.id, diff);
         logger.info('MTProto channel pts subscribed', channel.id, {
             username,
             pts: channelPts.get(channel.id),
@@ -184,8 +259,8 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         const channels = await prisma.channel.findMany({
             select: { id: true, link: true, telegramPeerId: true }
         });
-        for (const channel of channels) {
-            if (channelEntities.has(channel.id)) continue;
+        const pending = channels.filter(channel => !channelEntities.has(channel.id));
+        await runWithConcurrency(pending, pollConcurrency, async channel => {
             try {
                 await subscribe(channel);
             } catch (error) {
@@ -193,55 +268,140 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
                     error: error instanceof Error ? error.message : String(error)
                 });
             }
-        }
+        });
     };
 
-    client.addEventHandler(async (event: NewMessageEvent) => {
-        if (!event.isChannel) return;
-        try {
-            await ingest(event.message);
-        } catch (error) {
-            logger.error('MTProto message failed', undefined, { error });
-        }
-    }, new NewMessage({}));
-
     client.addEventHandler(async (update: Api.TypeUpdate) => {
-        if (!(update instanceof Api.UpdateNewChannelMessage) && !(update instanceof Api.UpdateNewMessage)) return;
-        if (!(update.message instanceof Api.Message)) return;
+        if (!(update instanceof Api.UpdateNewChannelMessage)) return;
+        if (!(update.message instanceof Api.Message) || !update.message.peerId) return;
         try {
-            await ingest(update.message);
+            const peerId = utils.getPeerId(update.message.peerId).toString();
+            const mapping = peerToChannel.get(peerId);
+            if (mapping) channelPts.set(mapping.channelId, update.pts);
+            ingest(update.message);
         } catch (error) {
             logger.error('MTProto raw update failed', undefined, { error });
         }
     }, new Raw({}));
 
     await syncChannels();
-    logger.info('MTProto channel difference poll started', undefined, { channels: channelMappings.size });
+    logger.info('MTProto channel difference poll started', undefined, {
+        channels: channelMappings.size,
+        pollConcurrency,
+        pollIntervalMs
+    });
+
+    const resyncChannel = async (channelId: number, entity: Api.Channel) => {
+        const full = await client.invoke(new Api.channels.GetFullChannel({ channel: entity }));
+        const freshPts = 'pts' in full.fullChat ? Number(full.fullChat.pts) : undefined;
+        const history = await client.invoke(
+            new Api.messages.GetHistory({
+                peer: entity,
+                limit: RESYNC_HISTORY_LIMIT
+            })
+        );
+        const messages = 'messages' in history ? history.messages : [];
+        for (const message of messages) {
+            if (message instanceof Api.Message) ingest(message);
+        }
+        if (freshPts != null) channelPts.set(channelId, freshPts);
+        logger.info('MTProto channel resynced', channelId, { pts: freshPts, messages: messages.length });
+    };
+
+    const pollChannel = async (mapping: ChannelMapping, entity: Api.Channel, pts: number) => {
+        try {
+            applyDifference(
+                mapping.channelId,
+                await fetchDifference(entity, pts, HOT_DIFFERENCE_LIMIT, false)
+            );
+            return;
+        } catch (error) {
+            noteFloodWait(error);
+            if (!isPtsOutdated(error)) {
+                logger.warn('MTProto channel poll failed', mapping.channelId, {
+                    username: mapping.username,
+                    error: error instanceof Error ? error.message : String(error)
+                });
+                return;
+            }
+        }
+
+        if (Date.now() < (resyncNotBefore.get(mapping.channelId) ?? 0)) return;
+
+        logger.warn('MTProto pts outdated, forcing difference', mapping.channelId, {
+            username: mapping.username,
+            pts
+        });
+        try {
+            applyDifference(
+                mapping.channelId,
+                await fetchDifference(entity, pts, HOT_DIFFERENCE_LIMIT, true)
+            );
+            return;
+        } catch (error) {
+            noteFloodWait(error);
+            if (!isPtsOutdated(error)) {
+                logger.warn('MTProto forced difference failed', mapping.channelId, {
+                    username: mapping.username,
+                    error: error instanceof Error ? error.message : String(error)
+                });
+                return;
+            }
+        }
+
+        resyncNotBefore.set(mapping.channelId, Date.now() + RESYNC_COOLDOWN_MS);
+        try {
+            await resyncChannel(mapping.channelId, entity);
+        } catch (error) {
+            noteFloodWait(error);
+            logger.warn('MTProto channel resync failed', mapping.channelId, {
+                username: mapping.username,
+                error: error instanceof Error ? error.message : String(error)
+            });
+        }
+    };
+
+    const schedulePoll = (mapping: ChannelMapping) => {
+        const entity = channelEntities.get(mapping.channelId);
+        const pts = channelPts.get(mapping.channelId);
+        if (!entity || pts == null) return;
+        if (pollInFlight.has(mapping.channelId)) return;
+
+        pollInFlight.add(mapping.channelId);
+        void pollChannel(mapping, entity, pts)
+            .catch(error => {
+                noteFloodWait(error);
+                logger.warn('MTProto poll task failed', mapping.channelId, {
+                    username: mapping.username,
+                    error: error instanceof Error ? error.message : String(error)
+                });
+            })
+            .finally(() => {
+                pollInFlight.delete(mapping.channelId);
+                channelNextPollAt.set(mapping.channelId, Date.now() + pollIntervalMs);
+            });
+    };
 
     const poll = async () => {
         while (running) {
-            for (const mapping of channelMappings.values()) {
-                const entity = channelEntities.get(mapping.channelId);
-                const pts = channelPts.get(mapping.channelId);
-                if (!entity || pts == null) continue;
-                try {
-                    const diff = await client.invoke(
-                        new Api.updates.GetChannelDifference({
-                            channel: entity,
-                            filter: new Api.ChannelMessagesFilterEmpty(),
-                            pts,
-                            limit: 100
-                        })
-                    );
-                    await applyDifference(mapping.channelId, diff);
-                } catch (error) {
-                    logger.warn('MTProto channel poll failed', mapping.channelId, {
-                        username: mapping.username,
-                        error: error instanceof Error ? error.message : String(error)
-                    });
+            const now = Date.now();
+            if (now >= globalPollPausedUntil) {
+                const due: ChannelMapping[] = [];
+                for (const mapping of channelMappings.values()) {
+                    if (pollInFlight.has(mapping.channelId)) continue;
+                    const nextAt = channelNextPollAt.get(mapping.channelId) ?? 0;
+                    if (nextAt <= now) due.push(mapping);
+                }
+                due.sort(
+                    (a, b) =>
+                        (channelNextPollAt.get(a.channelId) ?? 0) - (channelNextPollAt.get(b.channelId) ?? 0)
+                );
+                for (const mapping of due) {
+                    if (pollInFlight.size >= pollConcurrency) break;
+                    schedulePoll(mapping);
                 }
             }
-            await new Promise(resolve => setTimeout(resolve, POLL_GAP_MS));
+            await new Promise(resolve => setTimeout(resolve, POLL_TICK_MS));
         }
     };
     void poll();

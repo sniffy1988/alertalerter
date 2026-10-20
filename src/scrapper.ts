@@ -27,6 +27,7 @@ interface ScrapeJob {
     channelId: number;
     username: string;
     afterTelegramId?: number;
+    overdueMs?: number;
 }
 
 export type AddedChannel = {
@@ -56,7 +57,7 @@ export class Scraper {
     private pool: PoolEntry[] = [];
     private jobQueue: ScrapeJob[] = [];
     private inFlightCount = new Map<number, number>();
-    private static readonly MAX_INFLIGHT_PER_CHANNEL = 2;
+    private static readonly MAX_INFLIGHT_PER_CHANNEL = 1;
     private channelCache = new Map<number, CachedChannel>();
     private failureBackoffUntil = new Map<number, number>();
     private failureStreak = new Map<number, number>();
@@ -367,6 +368,7 @@ export class Scraper {
     private async triggerScrapeCycle() {
         const now = Date.now();
         const channels = Array.from(this.channelCache.values());
+        const dueJobs: ScrapeJob[] = [];
 
         for (const channel of channels) {
             const backoffUntil = this.failureBackoffUntil.get(channel.id) ?? 0;
@@ -374,17 +376,24 @@ export class Scraper {
 
             const lastScrape = channel.lastScrapedAt ? new Date(channel.lastScrapedAt).getTime() : 0;
             const elapsed = now - lastScrape;
+            const intervalMs = this.scrapeIntervalMs(channel);
             const queued = this.jobQueue.filter(j => j.channelId === channel.id).length;
             if (
-                elapsed >= this.scrapeIntervalMs(channel) &&
+                elapsed >= intervalMs &&
                 this.inFlightOf(channel.id) + queued < Scraper.MAX_INFLIGHT_PER_CHANNEL
             ) {
-                this.jobQueue.push({
+                dueJobs.push({
                     channelId: channel.id,
                     username: channel.link.split('/').pop() || '',
-                    afterTelegramId: channel.lastSeenTelegramId
+                    afterTelegramId: channel.lastSeenTelegramId,
+                    overdueMs: elapsed - intervalMs
                 });
             }
+        }
+
+        dueJobs.sort((a, b) => (b.overdueMs ?? 0) - (a.overdueMs ?? 0));
+        for (const { overdueMs: _overdue, ...job } of dueJobs) {
+            this.jobQueue.push(job);
         }
 
         while (this.jobQueue.length > 0 && this.getIdleWorker()) {
