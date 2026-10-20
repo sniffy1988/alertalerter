@@ -8,7 +8,7 @@ import { logger } from './logger';
 import { MessageProcessor, previewMessageText } from './messageProcessor';
 import { peerIdAliases, resolvePeerIdFromEntity } from './telegramPeerId';
 
-const MAX_POST_AGE_MS = 120_000;
+const MAX_HISTORICAL_POST_AGE_MS = 120_000;
 const KEEP_ALIVE_MS = 30_000;
 const CHANNEL_REFRESH_MS = 30_000;
 const RESYNC_COOLDOWN_MS = 15_000;
@@ -16,6 +16,13 @@ const RESYNC_HISTORY_LIMIT = 30;
 const HOT_DIFFERENCE_LIMIT = 10;
 const SUBSCRIBE_DIFFERENCE_LIMIT = 100;
 const POLL_TICK_MS = 50;
+const OUTDATED_BACKOFF_START_MS = 1_000;
+const OUTDATED_BACKOFF_CAP_MS = 5_000;
+const OUTDATED_FORCE_MIN_STREAK = 3;
+const NO_DIFF_RESYNC_MS = 30_000;
+const LIVE_PUSH_POLL_GUARD_MS = 1_000;
+
+type IngestMode = 'live' | 'historical';
 
 function parsePollConcurrency(): number {
     const n = Number(process.env.MTPROTO_POLL_CONCURRENCY);
@@ -39,6 +46,34 @@ function parseFloodWaitSeconds(error: unknown): number | null {
     const match = message.match(/FLOOD_WAIT[_\s](\d+)/i);
     if (match) return Number(match[1]);
     return null;
+}
+
+function diffTimeoutSeconds(diff: Api.updates.TypeChannelDifference): number | undefined {
+    if (diff instanceof Api.updates.ChannelDifferenceEmpty || diff instanceof Api.updates.ChannelDifference) {
+        const timeout = diff.timeout;
+        if (timeout != null && Number(timeout) > 0) return Number(timeout);
+    }
+    return undefined;
+}
+
+function pollDelayAfterDifference(diff: Api.updates.TypeChannelDifference, pollIntervalMs: number): number {
+    const timeoutSec = diffTimeoutSeconds(diff);
+    if (timeoutSec != null) return Math.max(pollIntervalMs, timeoutSec * 1000);
+    return pollIntervalMs;
+}
+
+function collectChannelMessageUpdates(update: Api.TypeUpdate): Api.UpdateNewChannelMessage[] {
+    const out: Api.UpdateNewChannelMessage[] = [];
+    if (update instanceof Api.UpdateNewChannelMessage) {
+        out.push(update);
+        return out;
+    }
+    if ('updates' in update && Array.isArray((update as { updates?: Api.TypeUpdate[] }).updates)) {
+        for (const inner of (update as { updates: Api.TypeUpdate[] }).updates) {
+            if (inner instanceof Api.UpdateNewChannelMessage) out.push(inner);
+        }
+    }
+    return out;
 }
 
 type ChannelMapping = { channelId: number; username: string; peerId: string };
@@ -116,8 +151,11 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
     const channelPts = new Map<number, number>();
     const channelEntities = new Map<number, Api.Channel>();
     const channelNextPollAt = new Map<number, number>();
+    const channelPollDelayMs = new Map<number, number>();
     const pollInFlight = new Set<number>();
     const resyncNotBefore = new Map<number, number>();
+    const outdatedStreak = new Map<number, number>();
+    const lastSuccessfulDiffAt = new Map<number, number>();
     const groupedSeen = new Set<string>();
     let globalPollPausedUntil = 0;
     let running = true;
@@ -129,35 +167,83 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         }
     };
 
+    const setChannelPts = (channelId: number, pts: number) => {
+        const prev = channelPts.get(channelId) ?? 0;
+        if (pts > prev) channelPts.set(channelId, pts);
+    };
+
+    const bumpPollAfterLivePush = (channelId: number) => {
+        const minNext = Date.now() + Math.max(pollIntervalMs, LIVE_PUSH_POLL_GUARD_MS);
+        const cur = channelNextPollAt.get(channelId) ?? 0;
+        if (minNext > cur) channelNextPollAt.set(channelId, minNext);
+    };
+
     const scheduleProcessor = (channelId: number, messages: Parameters<MessageProcessor['processIncomingMessages']>[1]) => {
         void processor.processIncomingMessages(channelId, messages).catch(error => {
             logger.error('MTProto processIncomingMessages failed', channelId, { error });
         });
     };
 
-    const ingest = (msg: Api.Message) => {
-        if (!msg.peerId || msg.editDate) return;
-        const peerId = utils.getPeerId(msg.peerId).toString();
-        const mapping = peerToChannel.get(peerId);
-        if (!mapping) return;
+    const ingest = (msg: Api.Message, mapping: ChannelMapping, mode: IngestMode) => {
+        if (!msg.peerId) {
+            logger.debug('MTProto skip message', mapping.channelId, {
+                reason: 'no_peer',
+                telegramId: msg.id
+            });
+            return;
+        }
+        if (msg.editDate) {
+            logger.debug('MTProto skip message', mapping.channelId, {
+                reason: 'edit',
+                telegramId: msg.id
+            });
+            return;
+        }
 
         const postedAt = (msg.date ?? 0) * 1000;
-        if (!postedAt || Date.now() - postedAt > MAX_POST_AGE_MS) return;
+        if (!postedAt) {
+            logger.debug('MTProto skip message', mapping.channelId, {
+                reason: 'no_date',
+                telegramId: msg.id
+            });
+            return;
+        }
+        if (mode === 'historical' && Date.now() - postedAt > MAX_HISTORICAL_POST_AGE_MS) {
+            logger.debug('MTProto skip message', mapping.channelId, {
+                reason: 'too_old',
+                telegramId: msg.id,
+                ageSec: Math.round((Date.now() - postedAt) / 1000)
+            });
+            return;
+        }
 
         if (msg.groupedId) {
             const key = `${mapping.peerId}:${msg.groupedId.toString()}`;
-            if (groupedSeen.has(key)) return;
+            if (groupedSeen.has(key)) {
+                logger.debug('MTProto skip message', mapping.channelId, {
+                    reason: 'grouped_duplicate',
+                    telegramId: msg.id
+                });
+                return;
+            }
             groupedSeen.add(key);
             if (groupedSeen.size > 1000) groupedSeen.clear();
         }
 
         const text = msg.message?.trim() ? msg.message : msg.media ? '(media)' : '';
-        if (!text.trim()) return;
+        if (!text.trim()) {
+            logger.debug('MTProto skip message', mapping.channelId, {
+                reason: 'empty_text',
+                telegramId: msg.id
+            });
+            return;
+        }
 
         logger.info('MTProto push received', mapping.channelId, {
             username: mapping.username,
             telegramId: msg.id,
-            preview: previewMessageText(text)
+            preview: previewMessageText(text),
+            mode
         });
         scheduleProcessor(mapping.channelId, [
             {
@@ -169,33 +255,62 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         ]);
     };
 
-    const applyDifference = (channelId: number, diff: Api.updates.TypeChannelDifference) => {
-        if (diff instanceof Api.updates.ChannelDifferenceEmpty) {
-            channelPts.set(channelId, Number(diff.pts));
+    const ingestFromMessage = (msg: Api.Message, mode: IngestMode) => {
+        if (!msg.peerId) return;
+        const peerId = utils.getPeerId(msg.peerId).toString();
+        const mapping = peerToChannel.get(peerId);
+        if (!mapping) {
+            logger.debug('MTProto skip message', undefined, {
+                reason: 'unknown_peer',
+                telegramId: msg.id,
+                peerId
+            });
             return;
         }
+        ingest(msg, mapping, mode);
+    };
+
+    const markDifferenceSuccess = (channelId: number) => {
+        outdatedStreak.delete(channelId);
+        lastSuccessfulDiffAt.set(channelId, Date.now());
+    };
+
+    const applyDifference = (
+        channelId: number,
+        diff: Api.updates.TypeChannelDifference,
+        mode: IngestMode
+    ): number => {
+        if (diff instanceof Api.updates.ChannelDifferenceEmpty) {
+            setChannelPts(channelId, Number(diff.pts));
+            markDifferenceSuccess(channelId);
+            return pollDelayAfterDifference(diff, pollIntervalMs);
+        }
         if (diff instanceof Api.updates.ChannelDifference) {
-            channelPts.set(channelId, Number(diff.pts));
+            setChannelPts(channelId, Number(diff.pts));
+            markDifferenceSuccess(channelId);
             const messages = diff.newMessages ?? [];
             if (messages.length > 0) {
                 logger.info('MTProto channel difference', channelId, {
                     newMessages: messages.length,
-                    pts: Number(diff.pts)
+                    pts: Number(diff.pts),
+                    final: diff.final ?? true
                 });
             }
             for (const message of messages) {
-                if (message instanceof Api.Message) ingest(message);
+                if (message instanceof Api.Message) ingestFromMessage(message, mode);
             }
-            return;
+            return pollDelayAfterDifference(diff, pollIntervalMs);
         }
         if (diff instanceof Api.updates.ChannelDifferenceTooLong) {
             const dialogPts = diff.dialog && 'pts' in diff.dialog ? Number(diff.dialog.pts) : undefined;
-            if (dialogPts != null) channelPts.set(channelId, dialogPts);
+            if (dialogPts != null) setChannelPts(channelId, dialogPts);
+            markDifferenceSuccess(channelId);
             logger.info('MTProto channel difference too long', channelId, { messages: diff.messages?.length ?? 0 });
             for (const message of diff.messages ?? []) {
-                if (message instanceof Api.Message) ingest(message);
+                if (message instanceof Api.Message) ingestFromMessage(message, mode);
             }
         }
+        return pollIntervalMs;
     };
 
     const fetchDifference = (entity: Api.Channel, pts: number, limit: number, force: boolean) =>
@@ -209,6 +324,28 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
             })
         );
 
+    const syncChannelDifference = async (
+        channelId: number,
+        entity: Api.Channel,
+        pts: number,
+        limit: number,
+        force: boolean,
+        mode: IngestMode
+    ): Promise<number> => {
+        let currentPts = pts;
+        let delayMs = pollIntervalMs;
+
+        while (true) {
+            const diff = await fetchDifference(entity, currentPts, limit, force);
+            delayMs = applyDifference(channelId, diff, mode);
+            currentPts = channelPts.get(channelId) ?? currentPts;
+
+            if (!(diff instanceof Api.updates.ChannelDifference) || diff.final !== false) {
+                return delayMs;
+            }
+        }
+    };
+
     const noteFloodWait = (error: unknown) => {
         const waitSec = parseFloodWaitSeconds(error);
         if (waitSec == null) return;
@@ -217,6 +354,21 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
             globalPollPausedUntil = until;
             logger.warn('MTProto poll paused for flood wait', undefined, { waitSec });
         }
+    };
+
+    const noteOutdatedBackoff = (channelId: number, streak: number) => {
+        const backoffMs = Math.min(
+            OUTDATED_BACKOFF_CAP_MS,
+            OUTDATED_BACKOFF_START_MS * 2 ** Math.max(0, streak - 1)
+        );
+        channelPollDelayMs.set(channelId, Math.max(pollIntervalMs, backoffMs));
+        channelNextPollAt.set(channelId, Date.now() + backoffMs);
+    };
+
+    const shouldForceOrResync = (channelId: number, streak: number): boolean => {
+        if (streak >= OUTDATED_FORCE_MIN_STREAK) return true;
+        const lastOk = lastSuccessfulDiffAt.get(channelId) ?? 0;
+        return Date.now() - lastOk >= NO_DIFF_RESYNC_MS;
     };
 
     const subscribe = async (channel: { id: number; link: string; telegramPeerId: string | null }) => {
@@ -243,15 +395,25 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
 
         const full = await client.invoke(new Api.channels.GetFullChannel({ channel: entity }));
         const pts = 'pts' in full.fullChat ? Number(full.fullChat.pts) : 1;
-        const diff = await fetchDifference(entity, pts, SUBSCRIBE_DIFFERENCE_LIMIT, true);
         channelEntities.set(channel.id, entity);
-        channelPts.set(channel.id, 'pts' in diff ? Number(diff.pts) : pts);
-        channelNextPollAt.set(channel.id, 0);
-        applyDifference(channel.id, diff);
+        setChannelPts(channel.id, pts);
+
+        const delayMs = await syncChannelDifference(
+            channel.id,
+            entity,
+            pts,
+            SUBSCRIBE_DIFFERENCE_LIMIT,
+            true,
+            'historical'
+        );
+        channelPollDelayMs.set(channel.id, delayMs);
+        channelNextPollAt.set(channel.id, Date.now() + delayMs);
+        lastSuccessfulDiffAt.set(channel.id, Date.now());
+
         logger.info('MTProto channel pts subscribed', channel.id, {
             username,
             pts: channelPts.get(channel.id),
-            difference: diff.className
+            nextPollMs: delayMs
         });
     };
 
@@ -272,13 +434,20 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
     };
 
     client.addEventHandler(async (update: Api.TypeUpdate) => {
-        if (!(update instanceof Api.UpdateNewChannelMessage)) return;
-        if (!(update.message instanceof Api.Message) || !update.message.peerId) return;
+        const channelUpdates = collectChannelMessageUpdates(update);
+        if (channelUpdates.length === 0) return;
+
         try {
-            const peerId = utils.getPeerId(update.message.peerId).toString();
-            const mapping = peerToChannel.get(peerId);
-            if (mapping) channelPts.set(mapping.channelId, update.pts);
-            ingest(update.message);
+            for (const channelUpdate of channelUpdates) {
+                if (!(channelUpdate.message instanceof Api.Message) || !channelUpdate.message.peerId) continue;
+                const peerId = utils.getPeerId(channelUpdate.message.peerId).toString();
+                const mapping = peerToChannel.get(peerId);
+                if (mapping) {
+                    setChannelPts(mapping.channelId, channelUpdate.pts);
+                    bumpPollAfterLivePush(mapping.channelId);
+                    ingest(channelUpdate.message, mapping, 'live');
+                }
+            }
         } catch (error) {
             logger.error('MTProto raw update failed', undefined, { error });
         }
@@ -302,18 +471,25 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         );
         const messages = 'messages' in history ? history.messages : [];
         for (const message of messages) {
-            if (message instanceof Api.Message) ingest(message);
+            if (message instanceof Api.Message) ingestFromMessage(message, 'historical');
         }
-        if (freshPts != null) channelPts.set(channelId, freshPts);
+        if (freshPts != null) setChannelPts(channelId, freshPts);
+        lastSuccessfulDiffAt.set(channelId, Date.now());
+        outdatedStreak.delete(channelId);
         logger.info('MTProto channel resynced', channelId, { pts: freshPts, messages: messages.length });
     };
 
     const pollChannel = async (mapping: ChannelMapping, entity: Api.Channel, pts: number) => {
         try {
-            applyDifference(
+            const delayMs = await syncChannelDifference(
                 mapping.channelId,
-                await fetchDifference(entity, pts, HOT_DIFFERENCE_LIMIT, false)
+                entity,
+                pts,
+                HOT_DIFFERENCE_LIMIT,
+                false,
+                'live'
             );
+            channelPollDelayMs.set(mapping.channelId, delayMs);
             return;
         } catch (error) {
             noteFloodWait(error);
@@ -326,17 +502,36 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
             }
         }
 
+        const streak = (outdatedStreak.get(mapping.channelId) ?? 0) + 1;
+        outdatedStreak.set(mapping.channelId, streak);
+        noteOutdatedBackoff(mapping.channelId, streak);
+
+        if (!shouldForceOrResync(mapping.channelId, streak)) {
+            logger.debug('MTProto poll early (pts outdated), backing off', mapping.channelId, {
+                username: mapping.username,
+                pts,
+                streak
+            });
+            return;
+        }
+
         if (Date.now() < (resyncNotBefore.get(mapping.channelId) ?? 0)) return;
 
         logger.warn('MTProto pts outdated, forcing difference', mapping.channelId, {
             username: mapping.username,
-            pts
+            pts,
+            streak
         });
         try {
-            applyDifference(
+            const delayMs = await syncChannelDifference(
                 mapping.channelId,
-                await fetchDifference(entity, pts, HOT_DIFFERENCE_LIMIT, true)
+                entity,
+                channelPts.get(mapping.channelId) ?? pts,
+                HOT_DIFFERENCE_LIMIT,
+                true,
+                'live'
             );
+            channelPollDelayMs.set(mapping.channelId, delayMs);
             return;
         } catch (error) {
             noteFloodWait(error);
@@ -349,9 +544,16 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
             }
         }
 
+        const forceStreak = (outdatedStreak.get(mapping.channelId) ?? 0) + 1;
+        outdatedStreak.set(mapping.channelId, forceStreak);
+        noteOutdatedBackoff(mapping.channelId, forceStreak);
+
+        if (!shouldForceOrResync(mapping.channelId, forceStreak)) return;
+
         resyncNotBefore.set(mapping.channelId, Date.now() + RESYNC_COOLDOWN_MS);
         try {
             await resyncChannel(mapping.channelId, entity);
+            channelPollDelayMs.set(mapping.channelId, pollIntervalMs);
         } catch (error) {
             noteFloodWait(error);
             logger.warn('MTProto channel resync failed', mapping.channelId, {
@@ -378,7 +580,10 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
             })
             .finally(() => {
                 pollInFlight.delete(mapping.channelId);
-                channelNextPollAt.set(mapping.channelId, Date.now() + pollIntervalMs);
+                const delay = channelPollDelayMs.get(mapping.channelId) ?? pollIntervalMs;
+                const scheduledAt = channelNextPollAt.get(mapping.channelId) ?? 0;
+                const fromNow = Date.now() + delay;
+                if (fromNow > scheduledAt) channelNextPollAt.set(mapping.channelId, fromNow);
             });
     };
 

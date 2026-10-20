@@ -94,8 +94,29 @@ function parseMessage($: CheerioRoot, element: any, messageId: number): ScrapedM
     };
 }
 
+const DATA_POST_RE = /data-post="[^/]+\/(\d+)"/g;
+
+function extractMessageIdsFromHtml(html: string): number[] {
+    const ids: number[] = [];
+    let match: RegExpExecArray | null;
+    DATA_POST_RE.lastIndex = 0;
+    while ((match = DATA_POST_RE.exec(html)) !== null) {
+        const id = parseInt(match[1], 10);
+        if (Number.isFinite(id) && id > 0) ids.push(id);
+    }
+    return ids;
+}
+
 async function scrapeChannel(username: string, afterTelegramId?: number): Promise<{ messages: ScrapedMessage[]; maxTelegramId?: number }> {
     const html = await fetchChannelHtml(username);
+    const quickIds = extractMessageIdsFromHtml(html);
+    if (quickIds.length > 0) {
+        const maxId = Math.max(...quickIds);
+        if (afterTelegramId != null && maxId <= afterTelegramId) {
+            return { messages: [], maxTelegramId: maxId };
+        }
+    }
+
     const $ = cheerio.load(html);
     const wraps = $('.tgme_widget_message_wrap').toArray();
     if (wraps.length === 0) return { messages: [] };

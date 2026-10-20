@@ -76,11 +76,16 @@ async function fetchWithRetry(url: string, maxAttempts = 2): Promise<string> {
     throw lastError;
 }
 
+async function fetchChannelHtmlOnce(url: string): Promise<string> {
+    const response = await axiosInstance.get(url);
+    return response.data as string;
+}
+
 export async function fetchChannelHtml(username: string): Promise<string> {
     let lastError: unknown;
     for (const host of hostsInOrder()) {
         try {
-            const html = await fetchWithRetry(channelPreviewUrl(host, username));
+            const html = await fetchChannelHtmlOnce(channelPreviewUrl(host, username));
             if (preferredHost !== host) setPreferredHost(host);
             return html;
         } catch (err) {
