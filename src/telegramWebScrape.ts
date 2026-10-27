@@ -1,4 +1,5 @@
-import { Client, fetch as undiciFetch } from 'undici';
+import https from 'https';
+import axios from 'axios';
 import { isMainThread, workerData } from 'worker_threads';
 
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
@@ -34,12 +35,14 @@ function hostsInOrder(): TelegramWebHost[] {
 }
 
 function errorCode(err: unknown): string | undefined {
+    if (axios.isAxiosError(err) && err.code) return err.code;
     if (!err || typeof err !== 'object') return undefined;
     const e = err as { code?: string; cause?: { code?: string } };
     return e.code ?? e.cause?.code;
 }
 
 function formatFetchError(err: unknown): string {
+    if (axios.isAxiosError(err) && err.response?.status != null) return `HTTP ${err.response.status}`;
     const e = err as HttpError;
     if (e?.response?.status != null) return `HTTP ${e.response.status}`;
     const code = errorCode(err);
@@ -55,13 +58,18 @@ function statusError(status: number): HttpError {
 }
 
 function normalizeTransportError(err: unknown): HttpError {
+    if (axios.isAxiosError(err) && err.response?.status != null) return statusError(err.response.status);
     const code = errorCode(err);
-    if (code && code.includes('TIMEOUT')) {
+    if (code === 'ECONNABORTED' || code === 'ETIMEDOUT' || (code != null && code.includes('TIMEOUT'))) {
         const timeout = new Error('timeout') as HttpError;
         timeout.code = 'ETIMEDOUT';
         return timeout;
     }
-    if (err instanceof Error) return err as HttpError;
+    if (err instanceof Error) {
+        const wrapped = err as HttpError;
+        if (code) wrapped.code = code;
+        return wrapped;
+    }
     return new Error(String(err)) as HttpError;
 }
 
@@ -69,39 +77,28 @@ function isConnectionError(err: unknown): boolean {
     const code = errorCode(err) ?? '';
     return code === 'ECONNRESET'
         || code === 'ECONNREFUSED'
-        || code === 'EPIPE'
-        || code === 'UND_ERR_SOCKET'
-        || code === 'UND_ERR_CLOSED'
-        || code.startsWith('ERR_HTTP2_');
+        || code === 'EPIPE';
 }
 
 async function requestOnce(url: string): Promise<string> {
-    const client = new Client(new URL(url).origin, {
-        allowH2: true,
-        connectTimeout: REQUEST_TIMEOUT_MS,
-        headersTimeout: REQUEST_TIMEOUT_MS,
-        bodyTimeout: REQUEST_TIMEOUT_MS
-    });
+    const agent = new https.Agent({ keepAlive: false });
     try {
-        let response: Awaited<ReturnType<typeof undiciFetch>>;
-        try {
-            response = await undiciFetch(url, {
-                dispatcher: client,
-                headers: {
-                    'user-agent': USER_AGENT
-                }
-            });
-        } catch (err) {
-            throw normalizeTransportError(err);
-        }
-
-        if (response.status < 200 || response.status >= 300) {
-            await response.body?.cancel().catch(() => undefined);
-            throw statusError(response.status);
-        }
-        return await response.text();
+        const response = await axios.get<string>(url, {
+            timeout: REQUEST_TIMEOUT_MS,
+            responseType: 'text',
+            httpsAgent: agent,
+            maxRedirects: 5,
+            headers: {
+                'User-Agent': USER_AGENT,
+                Connection: 'close'
+            },
+            validateStatus: (status) => status >= 200 && status < 300
+        });
+        return response.data;
+    } catch (err) {
+        throw normalizeTransportError(err);
     } finally {
-        await client.close().catch(() => undefined);
+        agent.destroy();
     }
 }
 

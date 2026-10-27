@@ -1,11 +1,14 @@
 import fs from 'fs';
+import { defaultIfEmpty, exhaustMap, from, interval, lastValueFrom, mergeMap } from 'rxjs';
+import { catchError } from 'rxjs/operators';
 import { TelegramClient, utils } from 'telegram';
 import { StringSession } from 'telegram/sessions';
 import { NewMessage, NewMessageEvent, Raw } from 'telegram/events';
 import { Api } from 'telegram/tl';
 import prisma from './db';
 import { logger } from './logger';
-import { MessageProcessor, previewMessageText } from './messageProcessor';
+import { previewMessageText } from './messageProcessor';
+import { getChannelFeed } from './channelFeed';
 import { markMtprotoLive, mtprotoLastLiveAt } from './mtprotoActivity';
 import { peerIdAliases, resolvePeerIdFromEntity } from './telegramPeerId';
 
@@ -115,24 +118,7 @@ function channelUsername(link: string): string | null {
     return /^[A-Za-z0-9_]+$/.test(trimmed) ? trimmed : null;
 }
 
-async function runWithConcurrency<T>(
-    items: T[],
-    limit: number,
-    fn: (item: T) => Promise<void>
-): Promise<void> {
-    if (items.length === 0) return;
-    let index = 0;
-    const workerCount = Math.min(limit, items.length);
-    const workers = Array.from({ length: workerCount }, async () => {
-        while (index < items.length) {
-            const i = index++;
-            await fn(items[i]);
-        }
-    });
-    await Promise.all(workers);
-}
-
-export async function startMtprotoIngest(processor: MessageProcessor): Promise<void> {
+export async function startMtprotoIngest(): Promise<void> {
     const apiId = Number(process.env.TELEGRAM_API_ID);
     const apiHash = process.env.TELEGRAM_API_HASH?.trim();
     const session = readSession();
@@ -175,9 +161,7 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
     const lastSuccessfulDiffAt = new Map<number, number>();
     const groupedSeen = new Set<string>();
     const warmInFlight = new Set<number>();
-    const liveDeliveryDedupe = new Map<string, number>();
     let globalPollPausedUntil = 0;
-    let running = true;
 
     const remember = (mapping: ChannelMapping) => {
         channelMappings.set(mapping.channelId, mapping);
@@ -197,24 +181,23 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         if (minNext > cur) channelNextPollAt.set(channelId, minNext);
     };
 
-    const scheduleProcessor = (channelId: number, messages: Parameters<MessageProcessor['processIncomingMessages']>[1]) => {
-        void processor.processIncomingMessages(channelId, messages).catch(error => {
-            logger.error('MTProto processIncomingMessages failed', channelId, { error });
-        });
+    type IncomingMessageShape = {
+        telegramId: number;
+        text: string;
+        date: Date;
+        source: string;
     };
 
-    const shouldSkipLiveDuplicate = (channelId: number, telegramId: number): boolean => {
-        const key = `${channelId}:${telegramId}`;
-        const expiresAt = liveDeliveryDedupe.get(key);
-        const now = Date.now();
-        if (expiresAt != null && expiresAt > now) return true;
-        liveDeliveryDedupe.set(key, now + 60_000);
-        if (liveDeliveryDedupe.size > 5000) {
-            for (const [k, exp] of liveDeliveryDedupe) {
-                if (exp <= now) liveDeliveryDedupe.delete(k);
-            }
+    const pushToFeed = (mapping: ChannelMapping, msg: IncomingMessageShape) => {
+        const feed = getChannelFeed(mapping.channelId);
+        if (!feed) {
+            logger.debug('MTProto skip message', mapping.channelId, {
+                reason: 'no_feed',
+                telegramId: msg.telegramId
+            });
+            return;
         }
-        return false;
+        feed.push([msg]);
     };
 
     const ingest = (msg: Api.Message, mapping: ChannelMapping, mode: IngestMode) => {
@@ -272,14 +255,6 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
             return;
         }
 
-        if (mode === 'live' && shouldSkipLiveDuplicate(mapping.channelId, msg.id)) {
-            logger.debug('MTProto skip message', mapping.channelId, {
-                reason: 'live_duplicate',
-                telegramId: msg.id
-            });
-            return;
-        }
-
         logger.info('MTProto push received', mapping.channelId, {
             username: mapping.username,
             telegramId: msg.id,
@@ -287,14 +262,12 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
             mode
         });
         if (mode === 'live') markMtprotoLive(mapping.channelId);
-        scheduleProcessor(mapping.channelId, [
-            {
-                telegramId: msg.id,
-                text,
-                date: new Date(postedAt),
-                source: 'mtproto'
-            }
-        ]);
+        pushToFeed(mapping, {
+            telegramId: msg.id,
+            text,
+            date: new Date(postedAt),
+            source: 'mtproto'
+        });
     };
 
     const ingestFromMessage = (msg: Api.Message, mode: IngestMode, channelId?: number) => {
@@ -513,21 +486,30 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         });
     };
 
-    const syncChannels = async () => {
-        const channels = await prisma.channel.findMany({
-            select: { id: true, link: true, telegramPeerId: true }
-        });
-        const pending = channels.filter(channel => !channelEntities.has(channel.id));
-        await runWithConcurrency(pending, pollConcurrency, async channel => {
-            try {
-                await subscribe(channel);
-            } catch (error) {
-                logger.warn('MTProto cannot subscribe channel', channel.id, {
-                    error: error instanceof Error ? error.message : String(error)
-                });
-            }
-        });
-    };
+    const syncChannelsOnce = () =>
+        from(
+            prisma.channel.findMany({
+                select: { id: true, link: true, telegramPeerId: true }
+            })
+        ).pipe(
+            mergeMap(channels => {
+                const pending = channels.filter(channel => !channelEntities.has(channel.id));
+                return from(pending).pipe(
+                    mergeMap(
+                        channel =>
+                            from(subscribe(channel)).pipe(
+                                catchError(error => {
+                                    logger.warn('MTProto cannot subscribe channel', channel.id, {
+                                        error: error instanceof Error ? error.message : String(error)
+                                    });
+                                    return from(Promise.resolve());
+                                })
+                            ),
+                        pollConcurrency
+                    )
+                );
+            })
+        );
 
     client.addEventHandler(async (update: Api.TypeUpdate) => {
         const channelUpdates = collectChannelMessageUpdates(update);
@@ -556,7 +538,7 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
         }
     }, new NewMessage({ incoming: true }));
 
-    await syncChannels();
+    await lastValueFrom(syncChannelsOnce().pipe(defaultIfEmpty(null)));
     logger.info('MTProto channel difference poll started', undefined, {
         channels: channelMappings.size,
         pollConcurrency,
@@ -690,32 +672,26 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
             });
     };
 
-    const poll = async () => {
-        while (running) {
-            const now = Date.now();
-            if (now >= globalPollPausedUntil) {
-                const due: ChannelMapping[] = [];
-                for (const mapping of channelMappings.values()) {
-                    if (pollInFlight.has(mapping.channelId)) continue;
-                    const nextAt = channelNextPollAt.get(mapping.channelId) ?? 0;
-                    if (nextAt <= now) due.push(mapping);
-                }
-                due.sort(
-                    (a, b) =>
-                        (channelNextPollAt.get(a.channelId) ?? 0) - (channelNextPollAt.get(b.channelId) ?? 0)
-                );
-                for (const mapping of due) {
-                    if (pollInFlight.size >= pollConcurrency) break;
-                    schedulePoll(mapping);
-                }
-            }
-            await new Promise(resolve => setTimeout(resolve, POLL_TICK_MS));
-        }
-    };
-    void poll();
+    interval(POLL_TICK_MS).subscribe(() => {
+        const now = Date.now();
+        if (now < globalPollPausedUntil) return;
 
-    setInterval(() => {
-        if (!running) return;
+        const due: ChannelMapping[] = [];
+        for (const mapping of channelMappings.values()) {
+            if (pollInFlight.has(mapping.channelId)) continue;
+            const nextAt = channelNextPollAt.get(mapping.channelId) ?? 0;
+            if (nextAt <= now) due.push(mapping);
+        }
+        due.sort(
+            (a, b) => (channelNextPollAt.get(a.channelId) ?? 0) - (channelNextPollAt.get(b.channelId) ?? 0)
+        );
+        for (const mapping of due) {
+            if (pollInFlight.size >= pollConcurrency) break;
+            schedulePoll(mapping);
+        }
+    });
+
+    interval(warmTickMs).subscribe(() => {
         const now = Date.now();
         for (const mapping of channelMappings.values()) {
             const entity = channelEntities.get(mapping.channelId);
@@ -733,15 +709,31 @@ export async function startMtprotoIngest(processor: MessageProcessor): Promise<v
                 })
                 .finally(() => warmInFlight.delete(mapping.channelId));
         }
-    }, warmTickMs);
+    });
 
-    setInterval(() => {
-        void client.invoke(new Api.updates.GetState()).catch(error => {
-            logger.warn('MTProto keepalive failed', undefined, { error });
-        });
-    }, KEEP_ALIVE_MS);
+    interval(KEEP_ALIVE_MS)
+        .pipe(
+            exhaustMap(() =>
+                from(client.invoke(new Api.updates.GetState())).pipe(
+                    catchError(error => {
+                        logger.warn('MTProto keepalive failed', undefined, { error });
+                        return from(Promise.resolve());
+                    })
+                )
+            )
+        )
+        .subscribe();
 
-    setInterval(() => {
-        void syncChannels().catch(error => logger.error('MTProto channel sync failed', undefined, { error }));
-    }, CHANNEL_REFRESH_MS);
+    interval(CHANNEL_REFRESH_MS)
+        .pipe(
+            exhaustMap(() =>
+                syncChannelsOnce().pipe(
+                    catchError(error => {
+                        logger.error('MTProto channel sync failed', undefined, { error });
+                        return from(Promise.resolve());
+                    })
+                )
+            )
+        )
+        .subscribe();
 }

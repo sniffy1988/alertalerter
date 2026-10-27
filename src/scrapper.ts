@@ -1,23 +1,11 @@
 import path from 'path';
 import { Worker } from 'worker_threads';
+import { exhaustMap, from, interval, Observable, Subscription } from 'rxjs';
 import prisma from './db';
 import { logger } from './logger';
-import { MessageProcessor, type IncomingMessage } from './messageProcessor';
+import { type IncomingMessage } from './messageProcessor';
+import { ChannelFeed } from './channelFeed';
 import { getPreferredHost, probeTelegramWebScrape } from './telegramWebScrape';
-
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-function parsePoolSize(): number {
-    const n = Number(process.env.SCRAPER_POOL_SIZE);
-    if (Number.isFinite(n) && n >= 1) return Math.min(16, Math.floor(n));
-    return 4;
-}
-
-function parseMaxScrapeIntervalMs(): number {
-    const n = Number(process.env.SCRAPER_MAX_INTERVAL_MS);
-    if (Number.isFinite(n) && n >= 50) return Math.min(5_000, Math.floor(n));
-    return 100;
-}
 
 interface WorkerResult {
     success: boolean;
@@ -34,7 +22,6 @@ interface ScrapeJob {
     channelId: number;
     username: string;
     afterTelegramId?: number;
-    overdueMs?: number;
 }
 
 export type AddedChannel = {
@@ -44,7 +31,12 @@ export type AddedChannel = {
     name: string | null;
 };
 
-type PoolEntry = { worker: Worker; busy: boolean; currentJob?: ScrapeJob };
+type ChannelWorker = {
+    worker: Worker;
+    busy: boolean;
+    channelId: number;
+    stopped: boolean;
+};
 
 type CachedChannel = AddedChannel & {
     lastScrapedAt: Date | null;
@@ -57,94 +49,86 @@ export function notifyScraperChannelAdded(channel: AddedChannel): void {
     activeScraper?.addChannel(channel);
 }
 
-/** Worker pool with job queue; each channel has its own scrapTimeout (ms) from DB. */
+/** One scrape worker and one RxJS feed per channel. */
 export class Scraper {
     private isRunning = false;
-    private intervalSeconds: number;
-    private pool: PoolEntry[] = [];
-    private jobQueue: ScrapeJob[] = [];
-    private inFlightCount = new Map<number, number>();
-    private static readonly MAX_INFLIGHT_PER_CHANNEL = 1;
+    private workers = new Map<number, ChannelWorker>();
+    private feeds = new Map<number, ChannelFeed>();
     private channelCache = new Map<number, CachedChannel>();
     private failureBackoffUntil = new Map<number, number>();
     private failureStreak = new Map<number, number>();
     private probed = false;
     private lastCacheRefreshAt = 0;
     private lastScrapeAt = 0;
-    private readonly poolSize: number;
+    private refreshSub: Subscription | null = null;
     private static readonly MIN_SLEEP_MS = 50;
     private static readonly CACHE_REFRESH_MS = 15_000;
-    private static readonly MAX_SCRAPE_INTERVAL_MS = parseMaxScrapeIntervalMs();
     private static readonly FAILURE_BACKOFF_START_MS = 500;
     private static readonly FAILURE_BACKOFF_CAP_MS = 5_000;
 
-    constructor(
-        intervalSeconds: number = 0.2,
-        private readonly processor: MessageProcessor
-    ) {
-        this.intervalSeconds = intervalSeconds;
-        this.poolSize = parsePoolSize();
+    constructor() {
         activeScraper = this;
     }
 
-    isPoolActive(): boolean {
-        return this.pool.length > 0;
+    isScrapeActive(): boolean {
+        return this.workers.size > 0;
     }
 
     getHealth() {
         return {
             channelCount: this.channelCache.size,
-            scrapeActive: this.isPoolActive(),
-            poolSize: this.poolSize,
+            scrapeActive: this.isScrapeActive(),
+            workerCount: this.workers.size,
             lastScrapeAt: this.lastScrapeAt > 0 ? new Date(this.lastScrapeAt).toISOString() : null
         };
     }
 
     addChannel(channel: AddedChannel): void {
         const prev = this.channelCache.get(channel.id);
-        this.channelCache.set(channel.id, {
+        const cached: CachedChannel = {
             ...channel,
             lastScrapedAt: prev?.lastScrapedAt ?? null,
             lastSeenTelegramId: prev?.lastSeenTelegramId
-        });
+        };
+        this.channelCache.set(channel.id, cached);
+        if (this.isRunning && this.probed) {
+            this.ensureChannelWorker(cached);
+            this.ensureChannelFeed(cached);
+        }
     }
 
     public async start() {
         if (this.isRunning) return;
         this.isRunning = true;
-        logger.info(
-            `Scraper ready (pool ${this.poolSize}, poll ${this.intervalSeconds * 1000}ms)`
-        );
+        logger.info('Scraper ready (one worker and one stream per channel)');
 
-        await prisma.channel.updateMany({
-            where: { scrapTimeout: { gt: Scraper.MAX_SCRAPE_INTERVAL_MS } },
-            data: { scrapTimeout: Scraper.MAX_SCRAPE_INTERVAL_MS }
-        });
+        await this.ensureWebProbe();
         await this.refreshChannelCache();
+        this.syncWorkers();
+        this.syncFeeds();
 
-        while (this.isRunning) {
-            await this.ensureWebProbe();
-            this.ensurePool();
-            if (Date.now() - this.lastCacheRefreshAt >= Scraper.CACHE_REFRESH_MS) {
-                try {
-                    await this.refreshChannelCache();
-                } catch (error) {
-                    logger.error('Failed to refresh channel cache:', undefined, { error });
-                }
-            }
-            try {
-                await this.triggerScrapeCycle();
-            } catch (error) {
-                logger.error('Error during scrape cycle:', undefined, { error });
-            }
-            await delay(this.computeSleepMs());
-        }
+        this.refreshSub = interval(this.cacheRefreshIntervalMs())
+            .pipe(
+                exhaustMap(() =>
+                    from(
+                        this.refreshChannelCache()
+                            .then(() => {
+                                this.syncWorkers();
+                                this.syncFeeds();
+                            })
+                            .catch(error => {
+                                logger.error('Failed to refresh channel cache:', undefined, { error });
+                            })
+                    )
+                )
+            )
+            .subscribe();
     }
 
     private async ensureWebProbe(): Promise<void> {
         if (this.probed) return;
-        this.probed = true;
         const webProbe = await probeTelegramWebScrape();
+        this.probed = true;
         if (webProbe.workingHost) {
             const failed = webProbe.attempts.filter(a => !a.ok);
             if (failed.length > 0) {
@@ -162,44 +146,8 @@ export class Scraper {
         }
     }
 
-    private ensurePool(): void {
-        if (this.pool.length > 0) return;
-        logger.info(`Scraper workers starting (${this.poolSize})`);
-        for (let i = 0; i < this.poolSize; i++) {
-            this.pool.push(this.createPoolWorker());
-        }
-    }
-
-    private computeSleepMs(): number {
-        const now = Date.now();
-        const pollMs = this.intervalSeconds * 1000;
-        let msUntilNextDue = pollMs;
-
-        for (const channel of this.channelCache.values()) {
-            const lastScrape = channel.lastScrapedAt ? new Date(channel.lastScrapedAt).getTime() : 0;
-            const remaining = this.scrapeIntervalMs(channel) - (now - lastScrape);
-            if (remaining <= 0) return Scraper.MIN_SLEEP_MS;
-            msUntilNextDue = Math.min(msUntilNextDue, remaining);
-        }
-
-        return Math.max(Scraper.MIN_SLEEP_MS, Math.min(pollMs, msUntilNextDue));
-    }
-
-    private scheduleNextCycle(): void {
-        if (!this.isRunning) return;
-        void this.triggerScrapeCycle().catch(error =>
-            logger.error('Error during scheduled scrape cycle:', undefined, { error })
-        );
-    }
-
-    private markScrapeSuccess(channelId: number, maxTelegramId?: number): void {
-        const now = Date.now();
-        this.lastScrapeAt = now;
-        const cached = this.channelCache.get(channelId);
-        if (!cached) return;
-        if (maxTelegramId != null) {
-            cached.lastSeenTelegramId = Math.max(cached.lastSeenTelegramId ?? 0, maxTelegramId);
-        }
+    private markScrapeSuccess(channelId: number): void {
+        this.lastScrapeAt = Date.now();
         this.failureStreak.delete(channelId);
         this.failureBackoffUntil.delete(channelId);
     }
@@ -214,66 +162,112 @@ export class Scraper {
         this.failureBackoffUntil.set(channelId, Date.now() + backoffMs);
     }
 
-    private inFlightOf(channelId: number): number {
-        return this.inFlightCount.get(channelId) ?? 0;
+    private msUntilScrapeDue(channel: CachedChannel): number {
+        const now = Date.now();
+        const backoffUntil = this.failureBackoffUntil.get(channel.id) ?? 0;
+        if (now < backoffUntil) return backoffUntil - now;
+        const lastScrape = channel.lastScrapedAt ? channel.lastScrapedAt.getTime() : 0;
+        const remaining = this.scrapeIntervalMs(channel) - (now - lastScrape);
+        return Math.max(Scraper.MIN_SLEEP_MS, remaining);
     }
 
-    private beginInFlight(channelId: number): void {
-        this.inFlightCount.set(channelId, this.inFlightOf(channelId) + 1);
+    private executeScrapeCycle(channel: CachedChannel, afterTelegramId: number): Observable<IncomingMessage[]> {
+        return new Observable(subscriber => {
+            const collected: IncomingMessage[] = [];
+
+            const runPage = (afterId: number) => {
+                const entry = this.workers.get(channel.id);
+                if (!entry || entry.stopped) {
+                    subscriber.next(collected);
+                    subscriber.complete();
+                    return;
+                }
+
+                const onMessage = (result: WorkerResult) => {
+                    entry.worker.off('message', onMessage);
+                    entry.busy = false;
+
+                    if (!result.success) {
+                        subscriber.error(result.error ?? new Error('Scrape failed'));
+                        return;
+                    }
+
+                    const tagged = (result.messages ?? []).map(message => ({
+                        ...message,
+                        source: message.source || 't.me'
+                    }));
+                    collected.push(...tagged);
+
+                    if (result.hasMore && result.maxTelegramId != null && !entry.stopped) {
+                        runPage(result.maxTelegramId);
+                        return;
+                    }
+
+                    subscriber.next(collected);
+                    subscriber.complete();
+                };
+
+                entry.busy = true;
+                channel.lastScrapedAt = new Date();
+                const job: ScrapeJob = {
+                    channelId: channel.id,
+                    username: this.channelUsername(channel),
+                    afterTelegramId: afterId
+                };
+                entry.worker.on('message', onMessage);
+                entry.worker.postMessage(job);
+            };
+
+            runPage(afterTelegramId);
+        });
     }
 
-    private endInFlight(channelId: number): void {
-        const next = this.inFlightOf(channelId) - 1;
-        if (next <= 0) this.inFlightCount.delete(channelId);
-        else this.inFlightCount.set(channelId, next);
-    }
+    private ensureChannelFeed(channel: CachedChannel): void {
+        if (this.feeds.has(channel.id)) return;
 
-    private releaseWorkerJob(entry: PoolEntry, failed: boolean): void {
-        const job = entry.currentJob;
-        if (!job) return;
-        entry.currentJob = undefined;
-        this.endInFlight(job.channelId);
-        if (failed) this.markScrapeFailure(job.channelId);
-    }
-
-    private handleWorkerResult(entry: PoolEntry, result: WorkerResult) {
-        this.releaseWorkerJob(entry, false);
-        entry.busy = false;
-
-        if (result.success && result.messages) {
-            this.markScrapeSuccess(result.channelId, result.maxTelegramId);
-            if (result.hasMore && result.maxTelegramId != null) {
-                this.jobQueue.push({
-                    channelId: result.channelId,
-                    username: result.username,
-                    afterTelegramId: result.maxTelegramId
-                });
-            }
-
-            const tagged = result.messages.map(message => ({ ...message, source: message.source || 't.me' }));
-            void this.processor.processIncomingMessages(result.channelId, tagged)
-                .then(({ persisted }) => {
-                    if (persisted > 0) {
-                        logger.info(`Scrape ingested ${persisted} new message(s)`, result.channelId, {
-                            username: result.username,
-                            fetched: result.messages!.length
-                        });
-                    } else {
-                        logger.debug('Scrape cycle: no new messages', result.channelId, {
-                            username: result.username,
-                            fetched: result.messages!.length
+        const channelName = channel.name || channel.link || 'Alert';
+        const initialPostId = channel.lastSeenTelegramId ?? 0;
+        const feed = new ChannelFeed(
+            { channelId: channel.id, channelName },
+            initialPostId,
+            afterId => this.executeScrapeCycle(channel, afterId),
+            {
+                msUntilDue: () => this.msUntilScrapeDue(channel),
+                onScrapeStart: () => {},
+                onScrapeSuccess: fetched => {
+                    this.markScrapeSuccess(channel.id);
+                    if (fetched > 0) {
+                        logger.debug('Scrape cycle complete', channel.id, {
+                            username: this.channelUsername(channel),
+                            fetched
                         });
                     }
-                })
-                .catch(err =>
-                    logger.error('processMessages error', result.channelId, { error: err })
-                );
-        } else if (result.error) {
-            this.markScrapeFailure(result.channelId);
-            logger.error(`Worker error for ${result.username}:`, result.channelId, { error: result.error });
-        }
+                },
+                onScrapeFailure: () => this.markScrapeFailure(channel.id)
+            }
+        );
+        void feed.start().catch(err =>
+            logger.error('Channel feed failed to start', channel.id, { error: err })
+        );
+        this.feeds.set(channel.id, feed);
+        logger.info('Channel feed started', channel.id, { username: this.channelUsername(channel) });
+    }
 
-        this.dispatchNext();
+    private stopChannelFeed(channelId: number): void {
+        const feed = this.feeds.get(channelId);
+        if (!feed) return;
+        feed.stop();
+        this.feeds.delete(channelId);
+    }
+
+    private syncFeeds(): void {
+        if (!this.probed) return;
+        for (const channelId of this.feeds.keys()) {
+            if (!this.channelCache.has(channelId)) this.stopChannelFeed(channelId);
+        }
+        for (const channel of this.channelCache.values()) {
+            this.ensureChannelFeed(channel);
+        }
     }
 
     private async refreshChannelCache() {
@@ -318,102 +312,78 @@ export class Scraper {
         return path.resolve(__dirname, `./scraper.worker${workerExt}`);
     }
 
-    private createPoolWorker(): PoolEntry {
+    private channelUsername(channel: CachedChannel): string {
+        return channel.link.split('/').pop() || '';
+    }
+
+    private ensureChannelWorker(channel: CachedChannel): ChannelWorker {
+        const existing = this.workers.get(channel.id);
+        if (existing) return existing;
+
         const isTS = __filename.endsWith('.ts');
         const worker = new Worker(this.getWorkerPath(), {
             execArgv: isTS ? ['-r', 'ts-node/register'] : [],
             workerData: { isTS, preferredHost: getPreferredHost() }
         });
-        const entry: PoolEntry = { worker, busy: false };
+        const entry: ChannelWorker = { worker, busy: false, channelId: channel.id, stopped: false };
+        this.workers.set(channel.id, entry);
+        logger.info('Scraper worker started', channel.id, { username: this.channelUsername(channel) });
 
-        worker.on('message', (result: WorkerResult) => this.handleWorkerResult(entry, result));
-        worker.on('error', (err) => {
-            logger.error('Worker crash', undefined, { error: err });
-            this.releaseWorkerJob(entry, true);
-            entry.busy = false;
-            this.removeFromPool(entry);
-            this.replacePoolWorker();
-            this.scheduleNextCycle();
+        worker.on('error', err => {
+            logger.error('Worker crash', channel.id, { error: err });
+            if (entry.busy) {
+                entry.busy = false;
+                this.markScrapeFailure(channel.id);
+            }
         });
-        worker.on('exit', (code) => {
-            if (code !== 0) logger.warn(`Worker exited with code ${code}`);
-            this.releaseWorkerJob(entry, true);
-            entry.busy = false;
-            this.removeFromPool(entry);
-            this.replacePoolWorker();
-            this.scheduleNextCycle();
+        worker.on('exit', code => {
+            if (entry.busy) {
+                entry.busy = false;
+                this.markScrapeFailure(channel.id);
+            }
+            if (entry.stopped || this.workers.get(channel.id) !== entry) return;
+            if (code !== 0) logger.warn(`Worker exited with code ${code}`, channel.id);
+            this.workers.delete(channel.id);
+            if (!this.isRunning) return;
+            const cached = this.channelCache.get(channel.id);
+            if (!cached) return;
+            this.ensureChannelWorker(cached);
         });
 
         return entry;
     }
 
-    private removeFromPool(entry: PoolEntry) {
-        const i = this.pool.indexOf(entry);
-        if (i !== -1) this.pool.splice(i, 1);
-    }
-
-    private replacePoolWorker() {
-        if (!this.isRunning) return;
-        if (this.pool.length >= this.poolSize) return;
-        this.pool.push(this.createPoolWorker());
-    }
-
-    private getIdleWorker(): PoolEntry | undefined {
-        return this.pool.find(p => !p.busy);
-    }
-
-    private dispatchNext() {
-        if (this.jobQueue.length === 0) return;
-        const entry = this.getIdleWorker();
+    private stopChannelWorker(channelId: number): void {
+        const entry = this.workers.get(channelId);
         if (!entry) return;
-        const job = this.jobQueue.shift()!;
-        this.beginInFlight(job.channelId);
-        entry.busy = true;
-        entry.currentJob = job;
-        const cached = this.channelCache.get(job.channelId);
-        if (cached) cached.lastScrapedAt = new Date();
-        entry.worker.postMessage(job);
+        entry.stopped = true;
+        this.workers.delete(channelId);
+        this.failureBackoffUntil.delete(channelId);
+        this.failureStreak.delete(channelId);
+        void entry.worker.terminate();
+    }
+
+    private syncWorkers(): void {
+        if (!this.probed) return;
+        for (const channelId of this.workers.keys()) {
+            if (!this.channelCache.has(channelId)) this.stopChannelWorker(channelId);
+        }
+        for (const channel of this.channelCache.values()) {
+            this.ensureChannelWorker(channel);
+        }
     }
 
     private scrapeIntervalMs(channel: CachedChannel): number {
-        const cap = Scraper.MAX_SCRAPE_INTERVAL_MS;
-        const floor = Math.min(50, cap);
-        return Math.min(Math.max(channel.scrapTimeout, floor), cap);
+        const configured = Number(channel.scrapTimeout);
+        if (!Number.isFinite(configured) || configured < Scraper.MIN_SLEEP_MS) return Scraper.MIN_SLEEP_MS;
+        return configured;
     }
 
-    private async triggerScrapeCycle() {
-        const now = Date.now();
-        const channels = Array.from(this.channelCache.values());
-        const dueJobs: ScrapeJob[] = [];
-
-        for (const channel of channels) {
-            const backoffUntil = this.failureBackoffUntil.get(channel.id) ?? 0;
-            if (now < backoffUntil) continue;
-
-            const lastScrape = channel.lastScrapedAt ? new Date(channel.lastScrapedAt).getTime() : 0;
-            const elapsed = now - lastScrape;
-            const intervalMs = this.scrapeIntervalMs(channel);
-            const queued = this.jobQueue.filter(j => j.channelId === channel.id).length;
-            if (
-                elapsed >= intervalMs &&
-                this.inFlightOf(channel.id) + queued < Scraper.MAX_INFLIGHT_PER_CHANNEL
-            ) {
-                dueJobs.push({
-                    channelId: channel.id,
-                    username: channel.link.split('/').pop() || '',
-                    afterTelegramId: channel.lastSeenTelegramId,
-                    overdueMs: elapsed - intervalMs
-                });
-            }
+    private cacheRefreshIntervalMs(): number {
+        let intervalMs = Scraper.CACHE_REFRESH_MS;
+        for (const channel of this.channelCache.values()) {
+            intervalMs = Math.min(intervalMs, this.scrapeIntervalMs(channel));
         }
-
-        dueJobs.sort((a, b) => (b.overdueMs ?? 0) - (a.overdueMs ?? 0));
-        for (const { overdueMs: _overdue, ...job } of dueJobs) {
-            this.jobQueue.push(job);
-        }
-
-        while (this.jobQueue.length > 0 && this.getIdleWorker()) {
-            this.dispatchNext();
-        }
+        return intervalMs;
     }
 }

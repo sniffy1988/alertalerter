@@ -2,17 +2,17 @@ import 'dotenv/config';
 import http from 'http';
 import { bot, notifyAdminsBotAlive } from './bot';
 import { Scraper } from './scrapper';
-import { registerAlertSender } from './alertSender';
-import { MessageProcessor } from './messageProcessor';
 import { enableSqliteWal } from './db';
 import { startMtprotoIngest } from './mtprotoIngest';
+import { rules$ } from './rules';
 
 async function main() {
     console.log('Starting app...');
     await enableSqliteWal();
 
-    const processor = new MessageProcessor();
-    const scraper = new Scraper(0.2, processor);
+    rules$.subscribe();
+
+    const scraper = new Scraper();
 
     const healthServer = http.createServer((req, res) => {
         if (req.url === '/health') {
@@ -34,9 +34,8 @@ async function main() {
         }
     });
 
-    registerAlertSender();
-    void scraper.start();
-    void startMtprotoIngest(processor);
+    await scraper.start();
+    void startMtprotoIngest();
 }
 
 main().catch((err) => {
