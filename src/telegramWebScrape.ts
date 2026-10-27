@@ -1,4 +1,4 @@
-import { Agent, fetch as undiciFetch } from 'undici';
+import { Client, fetch as undiciFetch } from 'undici';
 import { isMainThread, workerData } from 'worker_threads';
 
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
@@ -8,15 +8,6 @@ export const TELEGRAM_WEB_HOSTS = ['t.me', 'telegram.me'] as const;
 export type TelegramWebHost = (typeof TELEGRAM_WEB_HOSTS)[number];
 
 type HttpError = Error & { response?: { status: number }; code?: string };
-
-// One agent per thread. On an h2 origin, concurrent requests share that session.
-const dispatcher = new Agent({
-    allowH2: true,
-    connections: 8,
-    connectTimeout: REQUEST_TIMEOUT_MS,
-    headersTimeout: REQUEST_TIMEOUT_MS,
-    bodyTimeout: REQUEST_TIMEOUT_MS
-});
 
 function isTelegramWebHost(value: unknown): value is TelegramWebHost {
     return value === 't.me' || value === 'telegram.me';
@@ -33,9 +24,8 @@ export function setPreferredHost(host: TelegramWebHost): void {
     preferredHost = host;
 }
 
-export function channelPreviewUrl(host: TelegramWebHost, username: string, afterTelegramId?: number): string {
-    const base = `https://${host}/s/${username}`;
-    return afterTelegramId != null && afterTelegramId > 0 ? `${base}?after=${afterTelegramId}` : base;
+export function channelPreviewUrl(host: TelegramWebHost, username: string): string {
+    return `https://${host}/s/${username}`;
 }
 
 function hostsInOrder(): TelegramWebHost[] {
@@ -85,51 +75,50 @@ function isConnectionError(err: unknown): boolean {
         || code.startsWith('ERR_HTTP2_');
 }
 
-async function readBody(response: Awaited<ReturnType<typeof undiciFetch>>, incremental: boolean): Promise<string> {
-    const contentType = response.headers.get('content-type') ?? '';
-    if (incremental && contentType.includes('json')) {
-        const parsed = await response.json() as unknown;
-        return typeof parsed === 'string' ? parsed : '';
+async function requestOnce(url: string): Promise<string> {
+    const client = new Client(new URL(url).origin, {
+        allowH2: true,
+        connectTimeout: REQUEST_TIMEOUT_MS,
+        headersTimeout: REQUEST_TIMEOUT_MS,
+        bodyTimeout: REQUEST_TIMEOUT_MS
+    });
+    try {
+        let response: Awaited<ReturnType<typeof undiciFetch>>;
+        try {
+            response = await undiciFetch(url, {
+                dispatcher: client,
+                headers: {
+                    'user-agent': USER_AGENT
+                }
+            });
+        } catch (err) {
+            throw normalizeTransportError(err);
+        }
+
+        if (response.status < 200 || response.status >= 300) {
+            await response.body?.cancel().catch(() => undefined);
+            throw statusError(response.status);
+        }
+        return await response.text();
+    } finally {
+        await client.close().catch(() => undefined);
     }
-    return await response.text();
 }
 
-async function requestOnce(url: string, incremental: boolean): Promise<string> {
-    let response: Awaited<ReturnType<typeof undiciFetch>>;
+async function request(url: string): Promise<string> {
     try {
-        response = await undiciFetch(url, {
-            dispatcher,
-            headers: {
-                'user-agent': USER_AGENT,
-                ...(incremental ? { 'x-requested-with': 'XMLHttpRequest' } : {})
-            }
-        });
-    } catch (err) {
-        throw normalizeTransportError(err);
-    }
-
-    if (response.status < 200 || response.status >= 300) {
-        await response.body?.cancel().catch(() => undefined);
-        throw statusError(response.status);
-    }
-    return readBody(response, incremental);
-}
-
-async function request(url: string, incremental: boolean): Promise<string> {
-    try {
-        return await requestOnce(url, incremental);
+        return await requestOnce(url);
     } catch (err) {
         if (!isConnectionError(err)) throw err;
-        return await requestOnce(url, incremental);
+        return await requestOnce(url);
     }
 }
 
-export async function fetchChannelHtml(username: string, afterTelegramId?: number): Promise<string> {
-    const incremental = afterTelegramId != null && afterTelegramId > 0;
+export async function fetchChannelHtml(username: string): Promise<string> {
     let lastError: unknown;
     for (const host of hostsInOrder()) {
         try {
-            const html = await request(channelPreviewUrl(host, username, incremental ? afterTelegramId : undefined), incremental);
+            const html = await request(channelPreviewUrl(host, username));
             if (preferredHost !== host) setPreferredHost(host);
             return html;
         } catch (err) {
@@ -157,7 +146,7 @@ export async function probeTelegramWebScrape(
 
     for (const host of TELEGRAM_WEB_HOSTS) {
         try {
-            const html = await request(channelPreviewUrl(host, testUsername), false);
+            const html = await request(channelPreviewUrl(host, testUsername));
             if (html.includes('tgme_widget_message')) {
                 attempts.push({ host, ok: true });
                 setPreferredHost(host);

@@ -30,8 +30,6 @@ interface WorkerResult {
     log?: string;
 }
 
-const PAGE_SIZE = 20;
-
 function parseMessageId($: CheerioRoot, element: any): number | null {
     const dataId = $(element).find('.tgme_widget_message').attr('data-post');
     if (!dataId) return null;
@@ -97,32 +95,8 @@ function parseMessage($: CheerioRoot, element: any, messageId: number): ScrapedM
     };
 }
 
-const DATA_POST_RE = /data-post="[^/]+\/(\d+)"/g;
-
-function extractMessageIdsFromHtml(html: string): number[] {
-    const ids: number[] = [];
-    let match: RegExpExecArray | null;
-    DATA_POST_RE.lastIndex = 0;
-    while ((match = DATA_POST_RE.exec(html)) !== null) {
-        const id = parseInt(match[1], 10);
-        if (Number.isFinite(id) && id > 0) ids.push(id);
-    }
-    return ids;
-}
-
 async function scrapeChannel(username: string, afterTelegramId?: number): Promise<{ messages: ScrapedMessage[]; maxTelegramId?: number; hasMore?: boolean }> {
-    const html = await fetchChannelHtml(username, afterTelegramId);
-    if (!html.trim()) {
-        return { messages: [], maxTelegramId: afterTelegramId };
-    }
-    const quickIds = extractMessageIdsFromHtml(html);
-    if (quickIds.length > 0) {
-        const maxId = Math.max(...quickIds);
-        if (afterTelegramId != null && maxId <= afterTelegramId) {
-            return { messages: [], maxTelegramId: maxId };
-        }
-    }
-
+    const html = await fetchChannelHtml(username);
     const $ = cheerio.load(html);
     const wraps = $('.tgme_widget_message_wrap').toArray();
     if (wraps.length === 0) return { messages: [] };
@@ -145,11 +119,10 @@ async function scrapeChannel(username: string, afterTelegramId?: number): Promis
         if (parsed) messages.push(parsed);
     }
 
-    const pageMax = quickIds.length > 0 ? Math.max(...quickIds) : maxTelegramId;
     return {
         messages,
         maxTelegramId: maxTelegramId > 0 ? maxTelegramId : undefined,
-        hasMore: afterTelegramId != null && quickIds.length >= PAGE_SIZE && pageMax > afterTelegramId
+        hasMore: false
     };
 }
 
