@@ -1,7 +1,7 @@
-import { PrismaClient } from '@prisma/client';
+import { createPrismaClient } from '../src/prismaFactory';
 import { syncSeedChannels, syncSeedFilterPhrases } from '../src/seedLib';
 
-const prisma = new PrismaClient();
+const prisma = createPrismaClient();
 
 async function main() {
     await syncSeedChannels(prisma);

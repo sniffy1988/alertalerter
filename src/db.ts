@@ -1,10 +1,6 @@
-import { PrismaClient } from '@prisma/client';
+import { createPrismaClient } from './prismaFactory';
 
-// In Prisma 6, with SQLite, we don't need manual adapters 
-// for standard file-based operations. 
-// It will automatically use its internal engine.
-
-const prisma = new PrismaClient();
+const prisma = createPrismaClient();
 
 export async function enableSqliteWal(): Promise<void> {
     await prisma.$queryRawUnsafe('PRAGMA journal_mode=WAL');

@@ -1,5 +1,5 @@
 # Build Stage
-FROM node:20-slim AS builder
+FROM node:22-slim AS builder
 
 WORKDIR /app
 
@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends openssl python3
 
 COPY package*.json ./
 COPY prisma ./prisma/
+COPY prisma.config.ts ./
 
 RUN npm install
 
@@ -16,7 +17,7 @@ RUN npx prisma generate
 RUN npm run build
 
 # Production Stage
-FROM node:20-slim
+FROM node:22-slim
 
 WORKDIR /app
 
@@ -27,6 +28,7 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package*.json ./
 COPY --from=builder /app/prisma ./prisma
+COPY --from=builder /app/prisma.config.ts ./prisma.config.ts
 
 # Expose port for Prisma Studio (default 5555)
 EXPOSE 5555

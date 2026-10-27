@@ -1,4 +1,4 @@
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient } from './generated/prisma/client';
 
 export const SEED_CHANNELS = [
     { link: 'tlknewsua', name: 'TLK', scrapTimeout: 500 },
