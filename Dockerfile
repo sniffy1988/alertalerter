@@ -13,6 +13,8 @@ RUN npm install
 
 COPY . .
 
+# prisma.config.ts reads DATABASE_URL when the CLI loads; generate does not connect.
+ENV DATABASE_URL=file:/database/alerts.db
 RUN npx prisma generate
 RUN npm run build
 
