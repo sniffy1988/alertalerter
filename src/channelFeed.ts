@@ -27,8 +27,8 @@ export type ChannelFeedMeta = {
 export type ScrapeScheduleContext = {
     msUntilDue: () => number;
     onScrapeStart: () => void;
-    onScrapeSuccess: (fetchedCount: number) => void;
-    onScrapeFailure: () => void;
+    onScrapeSuccess: (messages: IncomingMessage[]) => void;
+    onScrapeFailure: (error: unknown) => void;
 };
 
 const feeds = new Map<number, ChannelFeed>();
@@ -146,9 +146,9 @@ export class ChannelFeed {
                     this.schedule.onScrapeStart();
                     return this.runScrape(this.lastIngestedPostId).pipe(
                         tap(msgs => this.push(msgs.map(m => ({ ...m, source: m.source || 't.me' })))),
-                        tap(msgs => this.schedule.onScrapeSuccess(msgs.length)),
+                        tap(msgs => this.schedule.onScrapeSuccess(msgs)),
                         catchError(err => {
-                            this.schedule.onScrapeFailure();
+                            this.schedule.onScrapeFailure(err);
                             logger.error('Scrape failed', this.meta.channelId, { error: err });
                             return EMPTY;
                         })

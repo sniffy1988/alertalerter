@@ -121,7 +121,7 @@ const upsertWatchedChannel = async (cleanLink: string) => {
     const channel = await prisma.channel.upsert({
         where: { link: cleanLink },
         update: {},
-        create: { link: cleanLink, name: cleanLink, scrapTimeout: 500 }
+        create: { link: cleanLink, name: cleanLink, scrapTimeout: 1500 }
     });
     notifyScraperChannelAdded({
         id: channel.id,

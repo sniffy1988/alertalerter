@@ -43,6 +43,16 @@ type CachedChannel = AddedChannel & {
     lastSeenTelegramId?: number;
 };
 
+function formatScrapeError(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    if (typeof error === 'string') return error;
+    try {
+        return JSON.stringify(error);
+    } catch {
+        return String(error);
+    }
+}
+
 let activeScraper: Scraper | null = null;
 
 export function notifyScraperChannelAdded(channel: AddedChannel): void {
@@ -61,6 +71,7 @@ export class Scraper {
     private lastCacheRefreshAt = 0;
     private lastScrapeAt = 0;
     private refreshSub: Subscription | null = null;
+    private scrapeStartedAt = new Map<number, number>();
     private static readonly MIN_SLEEP_MS = 50;
     private static readonly CACHE_REFRESH_MS = 15_000;
     private static readonly FAILURE_BACKOFF_START_MS = 500;
@@ -162,7 +173,28 @@ export class Scraper {
         this.failureBackoffUntil.set(channelId, Date.now() + backoffMs);
     }
 
-    private msUntilScrapeDue(channel: CachedChannel): number {
+    private logScrapeStatus(channelId: number, fetched: number, telegramIds: number[], error?: unknown): void {
+        const channel = this.channelCache.get(channelId);
+        const startedAt = this.scrapeStartedAt.get(channelId);
+        this.scrapeStartedAt.delete(channelId);
+        const backoffUntil = this.failureBackoffUntil.get(channelId) ?? 0;
+        const worker = this.workers.get(channelId);
+        logger.debug('Scrape status', channelId, {
+            username: channel ? this.channelUsername(channel) : undefined,
+            host: getPreferredHost(),
+            scrapTimeout: channel ? this.scrapeIntervalMs(channel) : undefined,
+            fetched,
+            ...(telegramIds.length > 0 ? { telegramIds } : {}),
+            durationMs: startedAt != null ? Date.now() - startedAt : undefined,
+            backoffMs: Math.max(0, backoffUntil - Date.now()),
+            worker: worker ? (worker.busy ? 'busy' : 'idle') : 'down',
+            ...(error !== undefined ? { error: formatScrapeError(error) } : {})
+        });
+    }
+
+    private msUntilScrapeDue(channelId: number): number {
+        const channel = this.channelCache.get(channelId);
+        if (!channel) return Scraper.CACHE_REFRESH_MS;
         const now = Date.now();
         const backoffUntil = this.failureBackoffUntil.get(channel.id) ?? 0;
         if (now < backoffUntil) return backoffUntil - now;
@@ -171,13 +203,14 @@ export class Scraper {
         return Math.max(Scraper.MIN_SLEEP_MS, remaining);
     }
 
-    private executeScrapeCycle(channel: CachedChannel, afterTelegramId: number): Observable<IncomingMessage[]> {
+    private executeScrapeCycle(channelId: number, afterTelegramId: number): Observable<IncomingMessage[]> {
         return new Observable(subscriber => {
             const collected: IncomingMessage[] = [];
 
             const runPage = (afterId: number) => {
-                const entry = this.workers.get(channel.id);
-                if (!entry || entry.stopped) {
+                const channel = this.channelCache.get(channelId);
+                const entry = this.workers.get(channelId);
+                if (!channel || !entry || entry.stopped) {
                     subscriber.next(collected);
                     subscriber.complete();
                     return;
@@ -227,23 +260,24 @@ export class Scraper {
 
         const channelName = channel.name || channel.link || 'Alert';
         const initialPostId = channel.lastSeenTelegramId ?? 0;
+        const channelId = channel.id;
         const feed = new ChannelFeed(
-            { channelId: channel.id, channelName },
+            { channelId, channelName },
             initialPostId,
-            afterId => this.executeScrapeCycle(channel, afterId),
+            afterId => this.executeScrapeCycle(channelId, afterId),
             {
-                msUntilDue: () => this.msUntilScrapeDue(channel),
-                onScrapeStart: () => {},
-                onScrapeSuccess: fetched => {
-                    this.markScrapeSuccess(channel.id);
-                    if (fetched > 0) {
-                        logger.debug('Scrape cycle complete', channel.id, {
-                            username: this.channelUsername(channel),
-                            fetched
-                        });
-                    }
+                msUntilDue: () => this.msUntilScrapeDue(channelId),
+                onScrapeStart: () => {
+                    this.scrapeStartedAt.set(channelId, Date.now());
                 },
-                onScrapeFailure: () => this.markScrapeFailure(channel.id)
+                onScrapeSuccess: messages => {
+                    this.markScrapeSuccess(channelId);
+                    this.logScrapeStatus(channelId, messages.length, messages.map(message => message.telegramId));
+                },
+                onScrapeFailure: error => {
+                    this.markScrapeFailure(channelId);
+                    this.logScrapeStatus(channelId, 0, [], error);
+                }
             }
         );
         void feed.start().catch(err =>
@@ -358,6 +392,7 @@ export class Scraper {
         if (!entry) return;
         entry.stopped = true;
         this.workers.delete(channelId);
+        this.scrapeStartedAt.delete(channelId);
         this.failureBackoffUntil.delete(channelId);
         this.failureStreak.delete(channelId);
         void entry.worker.terminate();
