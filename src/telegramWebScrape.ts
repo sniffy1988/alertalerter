@@ -3,7 +3,7 @@ import axios from 'axios';
 import { isMainThread, workerData } from 'worker_threads';
 
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
-const REQUEST_TIMEOUT_MS = 2500;
+const REQUEST_TIMEOUT_MS = 8000;
 
 export const TELEGRAM_WEB_HOSTS = ['t.me', 'telegram.me'] as const;
 export type TelegramWebHost = (typeof TELEGRAM_WEB_HOSTS)[number];
