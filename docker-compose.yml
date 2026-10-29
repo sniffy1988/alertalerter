@@ -4,6 +4,9 @@ services:
   app:
     image: ghcr.io/sniffy1988/alertalerter:latest
     restart: always
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:8080/" ]
       interval: 30s
