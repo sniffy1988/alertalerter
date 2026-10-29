@@ -3,7 +3,7 @@ import { defaultIfEmpty, exhaustMap, from, interval, lastValueFrom, mergeMap } f
 import { catchError } from 'rxjs/operators';
 import { TelegramClient, utils } from 'telegram';
 import { StringSession } from 'telegram/sessions';
-import { NewMessage, NewMessageEvent, Raw } from 'telegram/events';
+import { Raw } from 'telegram/events';
 import { Api } from 'telegram/tl';
 import prisma from './db';
 import { logger } from './logger';
@@ -511,32 +511,38 @@ export async function startMtprotoIngest(): Promise<void> {
             })
         );
 
-    client.addEventHandler(async (update: Api.TypeUpdate) => {
+    const liveQueue: { msg: Api.Message; pts?: number }[] = [];
+    let liveDrainScheduled = false;
+
+    const drainLiveQueue = () => {
+        liveDrainScheduled = false;
+        const batch = liveQueue.splice(0, liveQueue.length);
+        for (const job of batch) {
+            try {
+                handleLiveChannelUpdate(job.msg, job.pts);
+            } catch (error) {
+                logger.error('MTProto raw update failed', undefined, { error });
+            }
+        }
+        if (liveQueue.length > 0) scheduleLiveDrain();
+    };
+
+    const scheduleLiveDrain = () => {
+        if (liveDrainScheduled) return;
+        liveDrainScheduled = true;
+        setImmediate(drainLiveQueue);
+    };
+
+    // GramJS awaits every handler before the next update. Keep this callback to a queue push.
+    client.addEventHandler((update: Api.TypeUpdate) => {
         const channelUpdates = collectChannelMessageUpdates(update);
         if (channelUpdates.length === 0) return;
-
-        try {
-            for (const channelUpdate of channelUpdates) {
-                if (!(channelUpdate.message instanceof Api.Message) || !channelUpdate.message.peerId) continue;
-                handleLiveChannelUpdate(channelUpdate.message, channelUpdate.pts);
-            }
-        } catch (error) {
-            logger.error('MTProto raw update failed', undefined, { error });
+        for (const channelUpdate of channelUpdates) {
+            if (!(channelUpdate.message instanceof Api.Message) || !channelUpdate.message.peerId) continue;
+            liveQueue.push({ msg: channelUpdate.message, pts: channelUpdate.pts });
         }
+        scheduleLiveDrain();
     }, new Raw({}));
-
-    client.addEventHandler(async (event: NewMessageEvent) => {
-        try {
-            const msg = event.message;
-            if (!(msg instanceof Api.Message) || !msg.peerId) return;
-            const update = event.originalUpdate;
-            const pts =
-                update instanceof Api.UpdateNewChannelMessage ? update.pts : undefined;
-            handleLiveChannelUpdate(msg, pts);
-        } catch (error) {
-            logger.error('MTProto new message handler failed', undefined, { error });
-        }
-    }, new NewMessage({ incoming: true }));
 
     await lastValueFrom(syncChannelsOnce().pipe(defaultIfEmpty(null)));
     logger.info('MTProto channel difference poll started', undefined, {

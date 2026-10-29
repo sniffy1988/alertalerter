@@ -37,11 +37,9 @@ const LOOKUP_CACHE_TTL_MS = 30_000;
 type CachedSubscribers = { ids: bigint[]; expiresAt: number };
 
 const subscriberCache = new Map<number, CachedSubscribers>();
+const subscriberRefresh = new Map<number, Promise<bigint[]>>();
 
-export async function fetchSubscriberIds(channelId: number): Promise<bigint[]> {
-    const cached = subscriberCache.get(channelId);
-    if (cached && cached.expiresAt > Date.now()) return cached.ids;
-
+async function loadSubscriberIds(channelId: number): Promise<bigint[]> {
     const users = await prisma.user.findMany({
         where: { subscribedTo: { some: { id: channelId } }, silentMode: false },
         select: { telegramId: true }
@@ -52,6 +50,59 @@ export async function fetchSubscriberIds(channelId: number): Promise<bigint[]> {
         expiresAt: Date.now() + LOOKUP_CACHE_TTL_MS
     });
     return ids;
+}
+
+function refreshSubscriberIds(channelId: number): Promise<bigint[]> {
+    const existing = subscriberRefresh.get(channelId);
+    if (existing) return existing;
+    const pending = loadSubscriberIds(channelId).finally(() => subscriberRefresh.delete(channelId));
+    subscriberRefresh.set(channelId, pending);
+    return pending;
+}
+
+/** Hot path: return the last known list and refresh in the background when stale. */
+export function cachedSubscriberIds(channelId: number): bigint[] | undefined {
+    const cached = subscriberCache.get(channelId);
+    if (!cached) return undefined;
+    if (cached.expiresAt <= Date.now()) void refreshSubscriberIds(channelId);
+    return cached.ids;
+}
+
+export function fetchSubscriberIds(channelId: number): Promise<bigint[]> {
+    const cached = subscriberCache.get(channelId);
+    if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.ids);
+    return refreshSubscriberIds(channelId);
+}
+
+let persistTail: Promise<void> = Promise.resolve();
+
+/** SQLite writes yield the event loop so a live MTProto read is not stuck behind them. */
+function enqueuePersist(row: {
+    telegramId: number;
+    message: string;
+    mediaUrl?: string;
+    mediaType?: string;
+    date: Date;
+    channelId: number;
+    sent: boolean;
+    deliveryLagMs?: number;
+    ingestSource?: string;
+}): void {
+    persistTail = persistTail.then(
+        () =>
+            new Promise<void>(resolve => {
+                setImmediate(() => {
+                    persistMessage(row)
+                        .catch(error => {
+                            logger.error('Failed to persist message', row.channelId, {
+                                telegramId: row.telegramId,
+                                error
+                            });
+                        })
+                        .finally(resolve);
+                });
+            })
+    );
 }
 
 export function buildAlertBody(channelName: string, cleanedText: string, date: Date): string {
@@ -100,7 +151,7 @@ export async function persistMessage(row: {
     });
 }
 
-/** Persists the post. Sends alert only when `shouldNotify` and phrase filter matches. */
+/** Sends the alert when the filter matches, then persists the post off the caller. */
 export async function handleIncomingPost(
     channelId: number,
     channelName: string,
@@ -134,44 +185,40 @@ export async function handleIncomingPost(
     const queuedAt = Date.now();
     const deliveryLagMs = matched ? Math.max(0, queuedAt - msg.date.getTime()) : undefined;
 
-    try {
-        await persistMessage({
-            telegramId: msg.telegramId,
-            message: cleanedText,
-            mediaUrl: msg.mediaUrl,
-            mediaType: msg.mediaType,
-            date: msg.date,
-            channelId,
-            sent: matched,
-            deliveryLagMs,
-            ingestSource: source
-        });
-    } catch (error) {
-        logger.error('Failed to persist message', channelId, { telegramId: msg.telegramId, error });
-        return false;
+    let notified = false;
+    if (matched && shouldNotify) {
+        let subscriberIds = cachedSubscriberIds(channelId);
+        if (!subscriberIds) subscriberIds = await fetchSubscriberIds(channelId);
+        if (subscriberIds.length === 0) {
+            logger.warn('Matched filter but no subscribers to notify', channelId, {
+                telegramId: msg.telegramId
+            });
+        } else {
+            sendAlertToSubscribers(channelId, subscriberIds, {
+                outMessage: buildAlertBody(channelName, cleanedText, msg.date),
+                mediaUrl: msg.mediaUrl,
+                mediaType: msg.mediaType,
+                postedAt: msg.date.getTime(),
+                source
+            });
+            logger.info(`🚨 Alert sent for ${msg.telegramId}`, channelId, {
+                subscribers: subscriberIds.length,
+                source
+            });
+            notified = true;
+        }
     }
 
-    if (!matched || !shouldNotify) return false;
-
-    const subscriberIds = await fetchSubscriberIds(channelId);
-    if (subscriberIds.length === 0) {
-        logger.warn('Matched filter but no subscribers to notify', channelId, {
-            telegramId: msg.telegramId
-        });
-        return false;
-    }
-
-    const outMessage = buildAlertBody(channelName, cleanedText, msg.date);
-    sendAlertToSubscribers(channelId, subscriberIds, {
-        outMessage,
+    enqueuePersist({
+        telegramId: msg.telegramId,
+        message: cleanedText,
         mediaUrl: msg.mediaUrl,
         mediaType: msg.mediaType,
-        postedAt: msg.date.getTime(),
-        source
+        date: msg.date,
+        channelId,
+        sent: matched,
+        deliveryLagMs,
+        ingestSource: source
     });
-    logger.info(`🚨 Alert sent for ${msg.telegramId}`, channelId, {
-        subscribers: subscriberIds.length,
-        source
-    });
-    return true;
+    return notified;
 }

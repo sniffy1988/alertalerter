@@ -16,7 +16,7 @@ import {
 } from 'rxjs';
 import prisma from './db';
 import { logger } from './logger';
-import { handleIncomingPost, type IncomingMessage } from './messageProcessor';
+import { fetchSubscriberIds, handleIncomingPost, type IncomingMessage } from './messageProcessor';
 import { rules$ } from './rules';
 
 export type ChannelFeedMeta = {
@@ -71,6 +71,9 @@ export class ChannelFeed {
     async start(): Promise<void> {
         if (this.pipeSub) return;
         await this.loadCursorsFromDb();
+        await fetchSubscriberIds(this.meta.channelId).catch(err => {
+            logger.warn('Subscriber cache warm failed', this.meta.channelId, { error: err });
+        });
         this.startMessagePipe();
         this.startScrapeScheduler();
     }
