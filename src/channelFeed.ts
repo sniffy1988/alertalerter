@@ -168,7 +168,10 @@ export class ChannelFeed {
                         tap(msgs => this.schedule.onScrapeSuccess(msgs)),
                         catchError(err => {
                             this.schedule.onScrapeFailure(err);
-                            logger.error('Scrape failed', this.meta.channelId, { error: err });
+                            logger.error('Scrape failed', this.meta.channelId, {
+                                username: this.meta.channelName,
+                                error: err
+                            });
                             return EMPTY;
                         })
                     );

@@ -3,7 +3,13 @@ import axios from 'axios';
 import { isMainThread, workerData } from 'worker_threads';
 
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
-const REQUEST_TIMEOUT_MS = 8000;
+
+function requestTimeoutMs(): number {
+    const raw = process.env.TELEGRAM_WEB_REQUEST_TIMEOUT_MS;
+    if (raw == null || raw.trim() === '') return 12_000;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 1000 ? n : 12_000;
+}
 
 export const TELEGRAM_WEB_HOSTS = ['t.me', 'telegram.me'] as const;
 export type TelegramWebHost = (typeof TELEGRAM_WEB_HOSTS)[number];
@@ -80,11 +86,16 @@ function isConnectionError(err: unknown): boolean {
         || code === 'EPIPE';
 }
 
+function isTimeoutError(err: unknown): boolean {
+    const code = errorCode(err) ?? '';
+    return code === 'ETIMEDOUT' || code === 'ECONNABORTED';
+}
+
 async function requestOnce(url: string): Promise<string> {
     const agent = new https.Agent({ keepAlive: false });
     try {
         const response = await axios.get<string>(url, {
-            timeout: REQUEST_TIMEOUT_MS,
+            timeout: requestTimeoutMs(),
             responseType: 'text',
             httpsAgent: agent,
             maxRedirects: 5,
@@ -106,7 +117,7 @@ async function request(url: string): Promise<string> {
     try {
         return await requestOnce(url);
     } catch (err) {
-        if (!isConnectionError(err)) throw err;
+        if (!isConnectionError(err) && !isTimeoutError(err)) throw err;
         return await requestOnce(url);
     }
 }

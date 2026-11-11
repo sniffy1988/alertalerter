@@ -1,5 +1,17 @@
 import { bot } from './bot';
+import prisma from './db';
 import { logger } from './logger';
+
+function telegramApiErrorCode(err: unknown): number | undefined {
+    if (!err || typeof err !== 'object') return undefined;
+    const code = (err as { error_code?: number }).error_code;
+    return typeof code === 'number' ? code : undefined;
+}
+
+function isSubscriberUnreachable(err: unknown): boolean {
+    const code = telegramApiErrorCode(err);
+    return code === 403 || code === 400;
+}
 
 export type OutgoingAlert = {
     outMessage: string;
@@ -31,6 +43,25 @@ function sendOne(chatId: string, item: OutgoingAlert, channelId: number): void {
     const text = outgoingText(item);
 
     const onFail = (err: unknown) => {
+        if (isSubscriberUnreachable(err)) {
+            const telegramId = BigInt(chatId);
+            void prisma.user
+                .updateMany({
+                    where: { telegramId, silentMode: false },
+                    data: { silentMode: true }
+                })
+                .catch(updateErr => {
+                    logger.warn('Could not mark subscriber unreachable', channelId, {
+                        chatId,
+                        error: updateErr
+                    });
+                });
+            logger.info('Subscriber unreachable; silent mode enabled', channelId, {
+                chatId,
+                errorCode: telegramApiErrorCode(err)
+            });
+            return;
+        }
         logger.error('Alert send failed', channelId, { chatId, error: err });
     };
 
