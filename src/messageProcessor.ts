@@ -15,6 +15,8 @@ export type IncomingMessage = {
 
 export function cleanMessage(text: string): string {
     return text
+        .replace(/https?:\/\/tlkmapalarm\.xyz[^\s]*/gi, ' ')
+        .replace(/TLK\s*MAP\s*ALERTS/gi, ' ')
         .replace(/📷\s*TlkInst/gi, ' ')
         .replace(/🎞\s*Канал со стримами/gi, ' ')
         .replace(/✅ Підпишись на СХІ[ДD]/gi, ' ')

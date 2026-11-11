@@ -4,6 +4,7 @@ import { bot, notifyAdminsBotAlive } from './bot';
 import { Scraper } from './scrapper';
 import { enableSqliteWal } from './db';
 import { startMtprotoIngest } from './mtprotoIngest';
+import { startTlkMapFeed } from './tlkMapFeed';
 import { rules$ } from './rules';
 
 async function main() {
@@ -36,6 +37,7 @@ async function main() {
 
     await scraper.start();
     void startMtprotoIngest();
+    void startTlkMapFeed();
 }
 
 main().catch((err) => {

@@ -37,12 +37,14 @@ export function getChannelFeed(channelId: number): ChannelFeed | undefined {
     return feeds.get(channelId);
 }
 
+const MAP_INGEST_SOURCE = 'tlk-map';
+
 /** All channel messages flow through `inbound$`. Scrape and MTProto only enqueue here. */
 export class ChannelFeed {
-    /** Highest post id already taken into the pipe (persist / dedupe). */
-    private lastIngestedPostId: number;
-    /** Highest post id we already sent an alert for. */
-    private lastNotifiedPostId: number;
+    /** Cursor for t.me scrape (`afterTelegramId`); only moves on non-map ingest. */
+    private scrapeAfterId: number;
+    private readonly ingestedPostIds = new Set<number>();
+    private readonly notifiedPostIds = new Set<number>();
     private readonly inbound$ = new Subject<IncomingMessage>();
     private pipeSub: Subscription | null = null;
     private scrapeSub: Subscription | null = null;
@@ -53,13 +55,12 @@ export class ChannelFeed {
         private readonly runScrape: (afterTelegramId: number) => Observable<IncomingMessage[]>,
         private readonly schedule: ScrapeScheduleContext
     ) {
-        this.lastIngestedPostId = initialPostId;
-        this.lastNotifiedPostId = initialPostId;
+        this.scrapeAfterId = initialPostId;
         feeds.set(meta.channelId, this);
     }
 
     getLastIngestedPostId(): number {
-        return this.lastIngestedPostId;
+        return this.scrapeAfterId;
     }
 
     /** MTProto (and anything else) puts messages on the same inbound stream. */
@@ -88,34 +89,49 @@ export class ChannelFeed {
 
     private async loadCursorsFromDb(): Promise<void> {
         const channelId = this.meta.channelId;
-        const [allMax, sentMax] = await Promise.all([
+        const [allMax, ingestedRows, notifiedRows] = await Promise.all([
             prisma.message.aggregate({
                 where: { channelId },
                 _max: { telegramId: true }
             }),
-            prisma.message.aggregate({
+            prisma.message.findMany({
+                where: { channelId },
+                select: { telegramId: true }
+            }),
+            prisma.message.findMany({
                 where: { channelId, sent: true },
-                _max: { telegramId: true }
+                select: { telegramId: true }
             })
         ]);
-        const ingested = allMax._max.telegramId != null ? Number(allMax._max.telegramId) : this.lastIngestedPostId;
-        const notified =
-            sentMax._max.telegramId != null ? Number(sentMax._max.telegramId) : this.lastNotifiedPostId;
-        this.lastIngestedPostId = Math.max(this.lastIngestedPostId, ingested);
-        this.lastNotifiedPostId = Math.max(this.lastNotifiedPostId, notified);
+        for (const row of ingestedRows) {
+            this.ingestedPostIds.add(Number(row.telegramId));
+        }
+        for (const row of notifiedRows) {
+            this.notifiedPostIds.add(Number(row.telegramId));
+        }
+        const ingested =
+            allMax._max.telegramId != null ? Number(allMax._max.telegramId) : this.scrapeAfterId;
+        this.scrapeAfterId = Math.max(this.scrapeAfterId, ingested);
     }
 
-    /** Single pipe: every source → dedupe by post id → persist → notify only if newer than last alert. */
+    private isMapSource(msg: IncomingMessage): boolean {
+        return msg.source === MAP_INGEST_SOURCE;
+    }
+
+    /** Single pipe: every source → dedupe by post id → persist → notify per post id. */
     private startMessagePipe(): void {
         this.pipeSub = this.inbound$
             .pipe(
-                filter(msg => msg.telegramId > this.lastIngestedPostId),
+                filter(msg => !this.ingestedPostIds.has(msg.telegramId)),
                 tap(msg => {
-                    this.lastIngestedPostId = msg.telegramId;
+                    this.ingestedPostIds.add(msg.telegramId);
+                    if (!this.isMapSource(msg)) {
+                        this.scrapeAfterId = Math.max(this.scrapeAfterId, msg.telegramId);
+                    }
                 }),
                 withLatestFrom(rules$),
                 concatMap(([msg, rules]) => {
-                    const shouldNotify = msg.telegramId > this.lastNotifiedPostId;
+                    const shouldNotify = !this.notifiedPostIds.has(msg.telegramId);
                     return from(
                         handleIncomingPost(
                             this.meta.channelId,
@@ -126,7 +142,7 @@ export class ChannelFeed {
                         )
                     ).pipe(
                         tap(notified => {
-                            if (notified) this.lastNotifiedPostId = msg.telegramId;
+                            if (notified) this.notifiedPostIds.add(msg.telegramId);
                         }),
                         catchError(err => {
                             logger.error('Channel feed handle post failed', this.meta.channelId, {
@@ -147,7 +163,7 @@ export class ChannelFeed {
             .pipe(
                 exhaustMap(() => {
                     this.schedule.onScrapeStart();
-                    return this.runScrape(this.lastIngestedPostId).pipe(
+                    return this.runScrape(this.scrapeAfterId).pipe(
                         tap(msgs => this.push(msgs.map(m => ({ ...m, source: m.source || 't.me' })))),
                         tap(msgs => this.schedule.onScrapeSuccess(msgs)),
                         catchError(err => {
